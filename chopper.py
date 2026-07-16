@@ -312,7 +312,22 @@ def find_ffmpeg():
     ff, fp = shutil.which('ffmpeg'), shutil.which('ffprobe')
     if ff and fp:
         return ff, fp
-    from static_ffmpeg import run
+    try:
+        from static_ffmpeg import run
+    except ImportError:
+        # Launched with a python missing our deps (e.g. not via Chop.bat/.command) —
+        # try installing into that python, else explain instead of a raw module error.
+        subprocess.run([sys.executable, '-m', 'pip', 'install', 'static-ffmpeg'],
+                       capture_output=True)
+        import importlib
+        importlib.invalidate_caches()
+        try:
+            from static_ffmpeg import run
+        except ImportError:
+            raise RuntimeError(
+                'ffmpeg is missing. Launch the app with Chop.command (Mac) or Chop.bat '
+                '(Windows) to auto-install everything, or run: '
+                'python3 -m pip install static-ffmpeg') from None
     return run.get_or_fetch_platform_executables_else_raise()
 
 
