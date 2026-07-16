@@ -9,7 +9,7 @@ from xml.etree import ElementTree as ET
 sys.stdout.reconfigure(encoding='utf-8')
 from chopper import (Row, build_xmeml, find_columns, list_videos, match_score,
                      match_videos, norm_tokens, parse_range, parse_sheet, parse_tc,
-                     sanitize_filename)
+                     render_label_png, sanitize_filename)
 
 HERE = Path(__file__).parent
 
@@ -165,6 +165,38 @@ marker = root.find('sequence/marker')
 assert marker is not None and marker.find('comment').text == 'speed up'
 
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
+
+# --- label overlays ----------------------------------------------------------
+from PIL import Image
+with tempfile.TemporaryDirectory() as td:
+    png = Path(td) / 'lbl.png'
+    render_label_png('CTO (Army Commit)', None, 48, 1920, 1080, png)
+    im = Image.open(png)
+    assert im.size == (1920, 1080) and im.mode == 'RGBA'
+    assert im.getpixel((1900, 20))[3] == 0                    # top-right corner transparent
+    assert im.crop((0, 700, 960, 1080)).getbbox() is not None  # content bottom-left
+
+    # 4K sequence -> text scales up proportionally
+    png4k = Path(td) / 'lbl4k.png'
+    render_label_png('Goal', None, 48, 3840, 2160, png4k)
+    assert Image.open(png4k).size == (3840, 2160)
+
+# second video track with one still per labeled row, aligned to its clip
+xml_l = build_xmeml(test_rows, probes, 'Seq', {0: Path('lbl.png')})
+root_l = ET.fromstring(xml_l)
+vtracks = root_l.findall('.//video/track')
+assert len(vtracks) == 2
+overlays = vtracks[1].findall('clipitem')
+assert len(overlays) == 1                                     # only row 0 got a label png
+base = vtracks[0].findall('clipitem')[0]
+assert overlays[0].find('start').text == base.find('start').text
+assert overlays[0].find('end').text == base.find('end').text
+assert overlays[0].find('in').text == '0'
+purl = overlays[0].find('file/pathurl').text
+assert purl.startswith('file://localhost/') and purl.endswith('lbl.png')
+# audio track untouched, and no second video track when no labels
+assert len(root_l.findall('.//audio/track/clipitem')) == 2
+assert len(ET.fromstring(build_xmeml(test_rows, probes, 'Seq')).findall('.//video/track')) == 1
 
 print(f'ALL CHECKS PASSED — {len(rows)} rows parsed from the real sheet, '
       f'{len(whole)} whole-file clips, {len(flagged)} flagged for review')

@@ -7,7 +7,7 @@ if ! python3 -c 'import tkinter' 2>/dev/null; then
 fi
 # Own venv so pip install works on Homebrew/system Python too (PEP 668)
 [ -d .venv ] || python3 -m venv .venv || { read -p "Could not create venv. Press Enter..."; exit 1; }
-./.venv/bin/python -c 'import openpyxl, tkinterdnd2, static_ffmpeg' 2>/dev/null \
+./.venv/bin/python -c 'import openpyxl, tkinterdnd2, static_ffmpeg, PIL' 2>/dev/null \
   || ./.venv/bin/python -m pip install -q -r requirements.txt \
   || { read -p "Dependency install failed. Press Enter..."; exit 1; }
 ./.venv/bin/python chopper.py || read -p "Press Enter to close..."

@@ -310,27 +310,34 @@ def match_videos(rows, folder, threshold=0.55, exclude=None):
 
 # ------------------------------------------------------------------- ffmpeg
 
+def ensure_pip(module, pip_name):
+    """Import module, pip-installing it first if missing (launched outside Chop.bat/.command).
+
+    Raises ImportError if it still can't be imported after the install attempt.
+    """
+    try:
+        return __import__(module)
+    except ImportError:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name],
+                       capture_output=True)
+        import importlib
+        importlib.invalidate_caches()
+        return __import__(module)
+
+
 def find_ffmpeg():
     """Return (ffmpeg, ffprobe) paths. System PATH first, else static-ffmpeg."""
     ff, fp = shutil.which('ffmpeg'), shutil.which('ffprobe')
     if ff and fp:
         return ff, fp
     try:
+        ensure_pip('static_ffmpeg', 'static-ffmpeg')
         from static_ffmpeg import run
     except ImportError:
-        # Launched with a python missing our deps (e.g. not via Chop.bat/.command) —
-        # try installing into that python, else explain instead of a raw module error.
-        subprocess.run([sys.executable, '-m', 'pip', 'install', 'static-ffmpeg'],
-                       capture_output=True)
-        import importlib
-        importlib.invalidate_caches()
-        try:
-            from static_ffmpeg import run
-        except ImportError:
-            raise RuntimeError(
-                'ffmpeg is missing. Launch the app with Chop.command (Mac) or Chop.bat '
-                '(Windows) to auto-install everything, or run: '
-                'python3 -m pip install static-ffmpeg') from None
+        raise RuntimeError(
+            'ffmpeg is missing. Launch the app with Chop.command (Mac) or Chop.bat '
+            '(Windows) to auto-install everything, or run: '
+            'python3 -m pip install static-ffmpeg') from None
     return run.get_or_fetch_platform_executables_else_raise()
 
 
@@ -388,6 +395,32 @@ def cut_clip(ffmpeg, row, out_path):
     subprocess.run(cmd, capture_output=True, text=True, check=True)
 
 
+# ------------------------------------------------------------ label graphics
+
+def render_label_png(text, font_path, size, width, height, out_path):
+    """Full-frame transparent PNG with the label bottom-left — a Premiere overlay still.
+
+    `size` means pixels at 1080p; scaled proportionally for other sequence heights.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    px = max(8, round(size * height / 1080))
+    try:
+        font = ImageFont.truetype(str(font_path), px) if font_path else ImageFont.load_default(px)
+    except Exception:
+        font = ImageFont.load_default(px)
+    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    margin = round(height * 0.05)
+    pad = max(6, px // 3)
+    l, t, r, b = d.textbbox((0, 0), text, font=font)
+    tw, th = r - l, b - t
+    box = (margin, height - margin - th - 2 * pad, margin + tw + 2 * pad, height - margin)
+    d.rounded_rectangle(box, radius=max(4, pad // 2), fill=(0, 0, 0, 140))
+    d.text((margin + pad - l, height - margin - pad - th - t), text,
+           font=font, fill=(255, 255, 255, 255))
+    img.save(out_path)
+
+
 # -------------------------------------------------------------- timeline XML
 
 def _rate_xml(fps):
@@ -396,18 +429,21 @@ def _rate_xml(fps):
     return f'<rate><timebase>{tb}</timebase><ntsc>{ntsc}</ntsc></rate>'
 
 
-def build_xmeml(rows, probes, sequence_name):
+def build_xmeml(rows, probes, sequence_name, label_pngs=None):
     """FCP7 XML (xmeml v4) — the interchange format Premiere imports natively.
 
     rows: matched Rows (src set, times resolved); probes: {path_str: probe info}.
     Whole-file rows use the entire source. Notes become sequence markers.
+    label_pngs: optional {row_index: png_path} — full-frame stills laid on a second
+    video track above each clip (imports far more reliably than XML text generators).
     """
     fps_list = [probes[str(r.src)]['fps'] for r in rows]
     seq_fps = max(set(fps_list), key=fps_list.count)
     first = probes[str(rows[0].src)]
 
-    v_items, a_items, markers = [], [], []
+    v_items, a_items, o_items, markers = [], [], [], []
     file_defs = {}   # path -> file id (emit full <file> once, then reference)
+    png_defs = {}
     t = 0            # sequence playhead in frames
     for n, r in enumerate(rows, 1):
         p = probes[str(r.src)]
@@ -452,6 +488,24 @@ def build_xmeml(rows, probes, sequence_name):
                            f'<file id="{file_defs[path]}"/>'
                            f'<sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex>'
                            f'</sourcetrack>{links(vid, aid)}</clipitem>')
+        png = (label_pngs or {}).get(n - 1)
+        if png:
+            ppath = str(png)
+            if ppath not in png_defs:
+                png_defs[ppath] = f'file-png{len(png_defs) + 1}'
+                png_xml = (
+                    f'<file id="{png_defs[ppath]}"><name>{escape(Path(ppath).name)}</name>'
+                    f'<pathurl>{escape(Path(ppath).resolve().as_uri().replace("file:///", "file://localhost/"))}</pathurl>'
+                    f'{_rate_xml(seq_fps)}<duration>108000</duration>'
+                    f'<media><video><samplecharacteristics>{_rate_xml(seq_fps)}'
+                    f'<width>{first["width"]}</width><height>{first["height"]}</height>'
+                    f'</samplecharacteristics></video></media></file>')
+            else:
+                png_xml = f'<file id="{png_defs[ppath]}"/>'
+            o_items.append(f'<clipitem id="clipitem-l{n}"><name>{name}</name>'
+                           f'<enabled>TRUE</enabled><duration>108000</duration>{_rate_xml(seq_fps)}'
+                           f'<start>{t}</start><end>{t + dur}</end><in>0</in><out>{dur}</out>'
+                           f'{png_xml}</clipitem>')
         if r.notes:
             markers.append(f'<marker><name>{name}</name><comment>{escape(r.notes)}</comment>'
                            f'<in>{t}</in><out>-1</out></marker>')
@@ -464,7 +518,8 @@ def build_xmeml(rows, probes, sequence_name):
         f'<video><format><samplecharacteristics>{_rate_xml(seq_fps)}'
         f'<width>{first["width"]}</width><height>{first["height"]}</height>'
         f'<pixelaspectratio>square</pixelaspectratio></samplecharacteristics></format>'
-        f'<track>{"".join(v_items)}</track></video>'
+        f'<track>{"".join(v_items)}</track>'
+        + (f'<track>{"".join(o_items)}</track>' if o_items else '') + '</video>'
         f'<audio><track>{"".join(a_items)}</track></audio>'
         f'</media>{"".join(markers)}</sequence></xmeml>')
 
@@ -475,8 +530,12 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name).strip(' .') or 'clip'
 
 
-def generate(rows, out_dir, sequence_name, export_clips, log):
-    """Write timeline XML (+ optional clip files). Returns (xml_path, ok, failed)."""
+def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
+    """Write timeline XML (+ optional clip files). Returns (xml_path, ok, failed).
+
+    labels_cfg: optional {'font': Path|None, 'size': int} — render each row's label
+    as a still-image overlay on a second timeline track.
+    """
     ffmpeg, ffprobe = find_ffmpeg()
     rows = [r for r in rows if r.src is not None and (r.whole_file or (
         r.start is not None and r.end is not None and r.end > r.start))]
@@ -512,8 +571,38 @@ def generate(rows, out_dir, sequence_name, export_clips, log):
     if not rows:
         raise ValueError('No usable rows left after checking video durations')
 
+    label_pngs = {}
+    if labels_cfg:
+        try:
+            ensure_pip('PIL', 'pillow')
+        except ImportError:
+            log('WARNING: Pillow missing and could not auto-install — labels skipped. '
+                'Run: python3 -m pip install pillow')
+            labels_cfg = None
+    if labels_cfg:
+        first = probes[str(rows[0].src)]
+        label_dir = out_dir / 'labels'
+        label_dir.mkdir(exist_ok=True)
+        by_text = {}
+        for i, r in enumerate(rows):
+            if not r.label:
+                continue
+            if r.label not in by_text:
+                png = label_dir / f'{sanitize_filename(r.label)}.png'
+                try:
+                    render_label_png(r.label, labels_cfg.get('font'), labels_cfg.get('size', 48),
+                                     first['width'], first['height'], png)
+                    by_text[r.label] = png
+                except Exception as e:
+                    by_text[r.label] = None
+                    log(f'WARNING: could not render label "{r.label}": {e}')
+            if by_text[r.label]:
+                label_pngs[i] = by_text[r.label]
+        if label_pngs:
+            log(f'{sum(1 for v in by_text.values() if v)} label graphic(s) written to labels/')
+
     xml_path = out_dir / f'{sanitize_filename(sequence_name)}_timeline.xml'
-    xml_path.write_text(build_xmeml(rows, probes, sequence_name), encoding='utf-8')
+    xml_path.write_text(build_xmeml(rows, probes, sequence_name, label_pngs), encoding='utf-8')
     log(f'Timeline written: {xml_path.name}  (Premiere: File > Import)')
 
     ok, failed = 0, []
@@ -548,6 +637,23 @@ def estimate_clip_bytes(rows):
 
 
 # ------------------------------------------------------------------- GUI
+
+SETTINGS_PATH = Path.home() / '.clip_chopper.json'
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def save_settings(d):
+    try:
+        SETTINGS_PATH.write_text(json.dumps(d), encoding='utf-8')
+    except Exception:
+        pass
+
 
 def fmt_tc(sec):
     if sec is None:
@@ -608,18 +714,43 @@ def run_gui():
     ys.pack(side='right', fill='y')
 
     # --- bottom: options + generate + log ---------------------------------
+    cfg = load_settings()
     bot = ttk.Frame(root, padding=8)
     bot.pack(fill='x')
-    export_var = tk.BooleanVar(value=True)
-    export_chk = ttk.Checkbutton(bot, text='Also export clip files', variable=export_var)
-    export_chk.grid(row=0, column=0, sticky='w')
+
+    # label-overlay options
+    labels_var = tk.BooleanVar(value=cfg.get('labels_on', False))
+    font_var = tk.StringVar(value=cfg.get('font', ''))
+    size_var = tk.StringVar(value=str(cfg.get('size', 48)))
+    ttk.Checkbutton(bot, text='Add clip labels as text in the timeline',
+                    variable=labels_var).grid(row=0, column=0, sticky='w')
+    font_frame = ttk.Frame(bot)
+    font_frame.grid(row=0, column=1, columnspan=2, sticky='w', padx=(10, 0))
+    font_lbl = ttk.Label(font_frame, width=26, anchor='w',
+                         text=Path(font_var.get()).name if font_var.get() else '(default font)')
+    def pick_font():
+        p = filedialog.askopenfilename(title='Label font',
+                                       filetypes=[('Fonts', '*.ttf *.otf'), ('All files', '*.*')])
+        if p:
+            font_var.set(p)
+            font_lbl.configure(text=Path(p).name)
+    ttk.Button(font_frame, text='Font…', command=pick_font).pack(side='left')
+    font_lbl.pack(side='left', padx=6)
+    ttk.Label(font_frame, text='Size:').pack(side='left')
+    ttk.Entry(font_frame, textvariable=size_var, width=4).pack(side='left', padx=(4, 0))
+
+    export_var = tk.BooleanVar(value=cfg.get('export_clips', True))
+    ttk.Style().configure('Big.TCheckbutton', font=('TkDefaultFont', 10, 'bold'))
+    export_chk = ttk.Checkbutton(bot, text='Make individual clip files',
+                                 variable=export_var, style='Big.TCheckbutton')
+    export_chk.grid(row=1, column=0, sticky='w', pady=(6, 0))
     gen_btn = ttk.Button(bot, text='Generate', state='disabled', command=lambda: start_generate())
-    gen_btn.grid(row=0, column=1, padx=10)
+    gen_btn.grid(row=1, column=1, padx=10, pady=(6, 0))
     prog = ttk.Progressbar(bot, mode='determinate')
-    prog.grid(row=0, column=2, sticky='ew', padx=(0, 4))
+    prog.grid(row=1, column=2, sticky='ew', padx=(0, 4), pady=(6, 0))
     bot.columnconfigure(2, weight=1)
     log_box = tk.Text(bot, height=6, state='disabled', wrap='none')
-    log_box.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(6, 0))
+    log_box.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(6, 0))
 
     def log(msg):
         log_q.put(str(msg))
@@ -651,7 +782,7 @@ def run_gui():
         n_bad = sum(1 for r in state['rows'] if r.flags)
         if state['rows']:
             est = estimate_clip_bytes(state['rows']) / 1e6
-            export_chk.configure(text=f'Also export clip files (~{est:.0f} MB)')
+            export_chk.configure(text=f'Make individual clip files (~{est:.0f} MB)')
             log(f'{len(state["rows"])} clips parsed'
                 + (f', {n_bad} need review (red rows — double-click to fix)' if n_bad else ', all ok'))
         gen_btn.configure(state='normal' if state['rows'] and state['videos'] else 'disabled')
@@ -767,6 +898,20 @@ def run_gui():
         name = state['sheet'].stem.replace('_', ' ')
         export = export_var.get()
 
+        try:
+            lsize = max(8, int(float(size_var.get())))
+        except ValueError:
+            lsize = 48
+        labels_cfg = None
+        if labels_var.get():
+            lfont = Path(font_var.get()) if font_var.get() else None
+            if lfont and not lfont.exists():
+                log(f'Font file not found ({lfont}) — using default font')
+                lfont = None
+            labels_cfg = {'font': lfont, 'size': lsize}
+        save_settings({'labels_on': labels_var.get(), 'font': font_var.get(),
+                       'size': lsize, 'export_clips': export})
+
         def work():
             try:
                 done = [0]
@@ -776,7 +921,8 @@ def run_gui():
                     if msg.startswith('['):
                         done[0] += 1
                         root.after(0, lambda v=done[0]: prog.configure(value=v))
-                xml_path, ok, failed = generate(work_rows, out_dir, name, export, counting_log)
+                xml_path, ok, failed = generate(work_rows, out_dir, name, export,
+                                                counting_log, labels_cfg)
                 log(f'Done. Timeline: {xml_path}')
                 if export:
                     log(f'Clips: {ok} written' + (f', {len(failed)} failed' if failed else ''))
