@@ -1,0 +1,3 @@
+Chop.command text eol=lf
+*.py text
+*.bat text eol=crlf
