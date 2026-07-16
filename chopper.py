@@ -643,8 +643,9 @@ def estimate_clip_bytes(rows):
 # spreadsheet submits a SHA-256 hash of its contents (never names/clips/filenames) plus
 # a hashed machine id to a Google Form owned by the app's developer, once per sheet per
 # machine. Opt out any time: set the environment variable CLIP_CHOPPER_NO_TRACK=1.
-TRACK_URL = ''    # '.../formResponse' URL of the collection form; empty = tracking off
-TRACK_FIELDS = {'sheet': 'entry.0', 'machine': 'entry.0'}
+TRACK_URL = ('https://docs.google.com/forms/d/e/'
+             '1FAIpQLSe56Lj6Ipmnb7-PpnMEdczWWgz701ruhh4yqzTa85iPp7D0SQ/formResponse')
+TRACK_FIELDS = {'sheet': 'entry.1140511568', 'machine': 'entry.584151074'}
 
 
 def sheet_fingerprint(grid):

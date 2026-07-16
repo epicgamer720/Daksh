@@ -26,6 +26,17 @@ The spreadsheet just needs a column of timecode ranges like `52:10-52:17` (or `C
 for pre-cut clips), and ideally columns for game, order, label, and notes — the app finds them
 by header name or by what the cells look like.
 
+## Native Premiere text labels (optional)
+
+The timeline's label overlays are images. If you want **editable Premiere text** instead:
+
+1. One-time: in Premiere, make one text graphic styled how you want (your font/size),
+   select it → Graphics and Titles → **Export As Motion Graphics Template…**, then delete it.
+2. Generate/import the timeline **with the PNG-labels checkbox off** (or delete track V2).
+3. File → Scripts → **Run Script…** → pick `add_labels.jsx` → choose your saved .mogrt.
+
+Every clip gets a native text layer above it with its label, editable in Essential Graphics.
+
 ## Anonymous usage stats
 
 To count how many unique spreadsheets are used, the app may send a one-time anonymous ping when
