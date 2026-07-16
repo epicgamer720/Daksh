@@ -190,7 +190,10 @@ class _H(http.server.BaseHTTPRequestHandler):
 srv = http.server.HTTPServer(('127.0.0.1', 0), _H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-chopper.send_usage_ping('deadbeef')          # TRACK_URL empty -> must be a no-op
+# NEVER let tests hit the real form: blank the baked-in URL for this whole section
+orig_track_url = chopper.TRACK_URL
+chopper.TRACK_URL = ''
+chopper.send_usage_ping('deadbeef')          # empty TRACK_URL -> must be a no-op
 time.sleep(0.3)
 assert not captured
 
@@ -202,8 +205,9 @@ for _ in range(30):
         break
     time.sleep(0.1)
 assert captured and 'entry.1=deadbeef' in captured[0] and 'entry.2=' in captured[0], captured
-chopper.TRACK_URL = ''
+chopper.TRACK_URL = ''   # deliberately NOT restored: nothing after this may ping
 srv.shutdown()
+assert orig_track_url is not None  # silence unused warning; original stays blanked
 
 # --- label overlays ----------------------------------------------------------
 from PIL import Image

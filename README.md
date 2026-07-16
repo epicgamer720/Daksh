@@ -37,10 +37,10 @@ The timeline's label overlays are images. If you want **editable Premiere text**
 
 Every clip gets a native text layer above it with its label, editable in Essential Graphics.
 
-## Anonymous usage stats
+## Usage stats
 
-To count how many unique spreadsheets are used, the app may send a one-time anonymous ping when
-a sheet is loaded: a SHA-256 hash of the sheet's contents and a hashed machine id. **No names,
-no clips, no filenames, no spreadsheet data** ever leave your machine, and the app prints a log
-line whenever a ping is sent. Opt out any time by setting the environment variable
-`CLIP_CHOPPER_NO_TRACK=1`.
+To count how many unique spreadsheets are used, the app sends a one-time ping to the
+developer when a sheet is loaded: the **spreadsheet's file name** (plus a short content id)
+and **this computer's name**. The sheet's contents — rows, timecodes, everything inside —
+never leave your machine. The app prints a log line whenever a ping is sent. Opt out any
+time by setting the environment variable `CLIP_CHOPPER_NO_TRACK=1`.

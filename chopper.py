@@ -639,10 +639,10 @@ def estimate_clip_bytes(rows):
 
 # ---------------------------------------------------------------- usage ping
 
-# Anonymous usage stats, documented in README.md: when TRACK_URL is set, loading a
-# spreadsheet submits a SHA-256 hash of its contents (never names/clips/filenames) plus
-# a hashed machine id to a Google Form owned by the app's developer, once per sheet per
-# machine. Opt out any time: set the environment variable CLIP_CHOPPER_NO_TRACK=1.
+# Usage stats, documented in README.md: when TRACK_URL is set, loading a spreadsheet
+# submits its FILE NAME + a short content hash and this computer's name to a Google Form
+# owned by the app's developer, once per sheet per machine. Sheet contents never leave
+# the machine. Opt out any time: set the environment variable CLIP_CHOPPER_NO_TRACK=1.
 TRACK_URL = ('https://docs.google.com/forms/d/e/'
              '1FAIpQLSe56Lj6Ipmnb7-PpnMEdczWWgz701ruhh4yqzTa85iPp7D0SQ/formResponse')
 TRACK_FIELDS = {'sheet': 'entry.1140511568', 'machine': 'entry.584151074'}
@@ -667,7 +667,7 @@ def send_usage_ping(sheet_id, log=None):
         try:
             data = urllib.parse.urlencode({
                 TRACK_FIELDS['sheet']: sheet_id,
-                TRACK_FIELDS['machine']: machine_fingerprint()}).encode()
+                TRACK_FIELDS['machine']: f'{platform.node()} ({machine_fingerprint()})'}).encode()
             req = urllib.request.Request(TRACK_URL, data=data,
                                          headers={'User-Agent': 'Mozilla/5.0'})
             urllib.request.urlopen(req, timeout=5).read()
@@ -676,7 +676,7 @@ def send_usage_ping(sheet_id, log=None):
 
     threading.Thread(target=post, daemon=True).start()
     if log:
-        log('(anonymous usage ping — hashed ids only; set CLIP_CHOPPER_NO_TRACK=1 to disable)')
+        log('(usage ping sent — sheet name only, no contents; set CLIP_CHOPPER_NO_TRACK=1 to disable)')
 
 
 # ------------------------------------------------------------------- GUI
@@ -853,7 +853,7 @@ def run_gui():
             return
         fp = sheet_fingerprint(load_grid(path))
         if fp not in cfg.get('pinged', []):
-            send_usage_ping(fp, log)
+            send_usage_ping(f'{Path(path).stem} ({fp[:8]})', log)
             cfg['pinged'] = (cfg.get('pinged', []) + [fp])[-100:]
             save_settings(cfg)
 
