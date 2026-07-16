@@ -7,8 +7,9 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 sys.stdout.reconfigure(encoding='utf-8')
-from chopper import (Row, build_xmeml, find_columns, match_score, match_videos,
-                     norm_tokens, parse_range, parse_sheet, parse_tc, sanitize_filename)
+from chopper import (Row, build_xmeml, find_columns, list_videos, match_score,
+                     match_videos, norm_tokens, parse_range, parse_sheet, parse_tc,
+                     sanitize_filename)
 
 HERE = Path(__file__).parent
 
@@ -80,6 +81,15 @@ with tempfile.TemporaryDirectory() as td:
 assert crows[0].start == 600.0 and not crows[0].flags
 assert not crows[1].whole_file and crows[1].flags and 'could not read' in crows[1].flags[0]
 assert crows[2].whole_file and not crows[2].flags
+
+# hidden files (macOS "._*" AppleDouble on USB drives, dot-dirs) are never videos
+with tempfile.TemporaryDirectory() as td:
+    (Path(td) / 'vs calvary.mp4').touch()
+    (Path(td) / '._vs calvary.mp4').touch()
+    (Path(td) / '.Trashes').mkdir()
+    (Path(td) / '.Trashes' / 'old.mp4').touch()
+    vids = list_videos(td)
+    assert [v.name for v in vids] == ['vs calvary.mp4'], vids
 
 # digit guard: "Game 2" must not match "Game 1.mp4" when Game 2's video is missing
 with tempfile.TemporaryDirectory() as td:

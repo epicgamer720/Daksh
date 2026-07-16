@@ -259,8 +259,11 @@ def norm_tokens(name):
 
 
 def list_videos(folder, exclude=None):
-    return sorted(p for p in Path(folder).rglob('*')
+    folder = Path(folder)
+    return sorted(p for p in folder.rglob('*')
                   if p.suffix.lower() in VIDEO_EXTS and p.is_file()
+                  # skip hidden files/dirs — esp. macOS "._*" AppleDouble junk on USB drives
+                  and not any(part.startswith('.') for part in p.relative_to(folder).parts)
                   and not (exclude and exclude in p.parents))
 
 
@@ -481,7 +484,16 @@ def generate(rows, out_dir, sequence_name, export_clips, log):
         raise ValueError('No usable rows — every row is missing a video file or timecode')
 
     log(f'Probing {len({str(r.src) for r in rows})} video file(s)...')
-    probes = {str(r.src): probe(ffprobe, r.src) for r in rows}
+    probes, unreadable = {}, set()
+    for path in {str(r.src) for r in rows}:
+        try:
+            probes[path] = probe(ffprobe, path)
+        except Exception:
+            unreadable.add(path)
+            log(f'WARNING: could not read {Path(path).name} — skipping its clips')
+    rows = [r for r in rows if str(r.src) not in unreadable]
+    if not rows:
+        raise ValueError('None of the matched video files could be read')
     kept = []
     for r in rows:  # enforce real durations now that we know them
         d = probes[str(r.src)]['duration']
