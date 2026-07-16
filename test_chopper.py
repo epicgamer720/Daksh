@@ -166,6 +166,45 @@ assert marker is not None and marker.find('comment').text == 'speed up'
 
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 
+# --- usage ping --------------------------------------------------------------
+import http.server
+import threading
+import time
+import chopper
+from chopper import machine_fingerprint, sheet_fingerprint
+
+g1 = [['Game', 'Clip'], ['A', '1:00-1:05']]
+g2 = [['Game', 'Clip'], ['A', '1:00-1:06']]
+assert sheet_fingerprint(g1) == sheet_fingerprint(g1)
+assert sheet_fingerprint(g1) != sheet_fingerprint(g2)
+assert len(machine_fingerprint()) == 12
+
+captured = []
+class _H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        captured.append(self.rfile.read(int(self.headers['Content-Length'])).decode())
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), _H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+chopper.send_usage_ping('deadbeef')          # TRACK_URL empty -> must be a no-op
+time.sleep(0.3)
+assert not captured
+
+chopper.TRACK_URL = f'http://127.0.0.1:{srv.server_port}/'
+chopper.TRACK_FIELDS = {'sheet': 'entry.1', 'machine': 'entry.2'}
+chopper.send_usage_ping('deadbeef')
+for _ in range(30):
+    if captured:
+        break
+    time.sleep(0.1)
+assert captured and 'entry.1=deadbeef' in captured[0] and 'entry.2=' in captured[0], captured
+chopper.TRACK_URL = ''
+srv.shutdown()
+
 # --- label overlays ----------------------------------------------------------
 from PIL import Image
 with tempfile.TemporaryDirectory() as td:

@@ -12,7 +12,10 @@ Source videos are only ever read, never copied or re-encoded.
 import copy
 import csv
 import difflib
+import hashlib
 import json
+import os
+import platform
 import queue
 import re
 import shutil
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -411,13 +415,10 @@ def render_label_png(text, font_path, size, width, height, out_path):
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     margin = round(height * 0.05)
-    pad = max(6, px // 3)
-    l, t, r, b = d.textbbox((0, 0), text, font=font)
-    tw, th = r - l, b - t
-    box = (margin, height - margin - th - 2 * pad, margin + tw + 2 * pad, height - margin)
-    d.rounded_rectangle(box, radius=max(4, pad // 2), fill=(0, 0, 0, 140))
-    d.text((margin + pad - l, height - margin - pad - th - t), text,
-           font=font, fill=(255, 255, 255, 255))
+    stroke = max(2, px // 24)  # slim dark outline so white text survives bright footage
+    l, t, r, b = d.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    d.text((margin - l, height - margin - (b - t) - t), text, font=font,
+           fill=(255, 255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0, 200))
     img.save(out_path)
 
 
@@ -636,6 +637,47 @@ def estimate_clip_bytes(rows):
     return total
 
 
+# ---------------------------------------------------------------- usage ping
+
+# Anonymous usage stats, documented in README.md: when TRACK_URL is set, loading a
+# spreadsheet submits a SHA-256 hash of its contents (never names/clips/filenames) plus
+# a hashed machine id to a Google Form owned by the app's developer, once per sheet per
+# machine. Opt out any time: set the environment variable CLIP_CHOPPER_NO_TRACK=1.
+TRACK_URL = ''    # '.../formResponse' URL of the collection form; empty = tracking off
+TRACK_FIELDS = {'sheet': 'entry.0', 'machine': 'entry.0'}
+
+
+def sheet_fingerprint(grid):
+    payload = '\n'.join('\t'.join(row) for row in grid)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def machine_fingerprint():
+    raw = platform.node() + str(Path.home()) + sys.platform
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]
+
+
+def send_usage_ping(sheet_id, log=None):
+    """Fire-and-forget anonymous ping (hashed ids only). Never blocks or raises."""
+    if not TRACK_URL or os.environ.get('CLIP_CHOPPER_NO_TRACK'):
+        return
+
+    def post():
+        try:
+            data = urllib.parse.urlencode({
+                TRACK_FIELDS['sheet']: sheet_id,
+                TRACK_FIELDS['machine']: machine_fingerprint()}).encode()
+            req = urllib.request.Request(TRACK_URL, data=data,
+                                         headers={'User-Agent': 'Mozilla/5.0'})
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception:
+            pass
+
+    threading.Thread(target=post, daemon=True).start()
+    if log:
+        log('(anonymous usage ping — hashed ids only; set CLIP_CHOPPER_NO_TRACK=1 to disable)')
+
+
 # ------------------------------------------------------------------- GUI
 
 SETTINGS_PATH = Path.home() / '.clip_chopper.json'
@@ -807,6 +849,12 @@ def run_gui():
             rematch()
         except Exception as e:
             messagebox.showerror('Could not read spreadsheet', str(e))
+            return
+        fp = sheet_fingerprint(load_grid(path))
+        if fp not in cfg.get('pinged', []):
+            send_usage_ping(fp, log)
+            cfg['pinged'] = (cfg.get('pinged', []) + [fp])[-100:]
+            save_settings(cfg)
 
     def pick_sheet():
         p = filedialog.askopenfilename(filetypes=[('Spreadsheets', '*.xlsx *.csv'), ('All files', '*.*')])
@@ -909,8 +957,9 @@ def run_gui():
                 log(f'Font file not found ({lfont}) — using default font')
                 lfont = None
             labels_cfg = {'font': lfont, 'size': lsize}
-        save_settings({'labels_on': labels_var.get(), 'font': font_var.get(),
-                       'size': lsize, 'export_clips': export})
+        cfg.update({'labels_on': labels_var.get(), 'font': font_var.get(),
+                    'size': lsize, 'export_clips': export})
+        save_settings(cfg)
 
         def work():
             try:
