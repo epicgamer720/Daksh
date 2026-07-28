@@ -783,13 +783,16 @@ def fmt_tc(sec):
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    DND_FILES, dnd_error = None, None
     try:
+        ensure_pip('tkinterdnd2', 'tkinterdnd2')   # may be missing if run outside the launcher
         from tkinterdnd2 import TkinterDnD, DND_FILES
         root = TkinterDnD.Tk()
         has_dnd = True
-    except Exception:
+    except Exception as e:
         root = tk.Tk()
         has_dnd = False
+        dnd_error = f'{type(e).__name__}: {e}'
 
     root.title('Clip Chopper')
     root.geometry('1100x640')
@@ -1147,20 +1150,41 @@ def run_gui():
     tree.bind('<Button-2>', on_right_click)     # macOS right-click / two-finger tap
     if has_dnd:
         def on_drop(event):
-            paths = [Path(p) for p in root.tk.splitlist(event.data)]
-            folders = [p for p in paths if p.is_dir()]
-            sheets = [p for p in paths if p.is_file()]
-            if folders:
-                add_videos(folders)
-            if sheets:
-                load_sheet(sheets[0])
-        for w in (root, sheet_lbl):
-            w.drop_target_register(DND_FILES)
-            w.dnd_bind('<<Drop>>', on_drop)
+            try:
+                paths = [Path(p) for p in root.tk.splitlist(event.data)]
+                folders = [p for p in paths if p.is_dir()]
+                sheets = [p for p in paths if p.is_file()]
+                if folders:
+                    add_videos(folders)
+                if sheets:
+                    load_sheet(sheets[0])
+                if not folders and not sheets:
+                    log(f'Could not read what was dropped: {event.data!r}')
+            except Exception as e:      # a raised handler silently kills further drops
+                log(f'Drop failed: {e}')
+
+        def register(w, depth=0):
+            """Every widget must opt in — a drop onto an unregistered one does nothing."""
+            try:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind('<<Drop>>', on_drop)
+            except Exception:
+                pass                     # some ttk widgets refuse; the rest still work
+            for child in w.winfo_children():
+                register(child, depth + 1)
+        register(root)
 
     drain_log()
     log('1) Load your spreadsheet   2) Add your video folder(s) — subfolders are searched too'
         '   3) Review the table   4) Generate')
+    if has_dnd:
+        log('Drag and drop is ON — drop your sheet or video folders anywhere in this window.')
+    else:
+        log('Drag and drop is OFF on this machine — use the Browse… / Add folder… buttons '
+            'instead (everything works the same).')
+        log(f'   reason: {dnd_error}')
+        log('   to fix: quit, run "python3 -m pip install tkinterdnd2" in Terminal, '
+            'and start the app with Chop.command (Mac) or Chop.bat (Windows).')
     root.mainloop()
 
 
