@@ -297,6 +297,61 @@ def rel_to_root(path, roots):
     return Path(path.name)
 
 
+# One club, several age groups: the same tournament folder holds 2027/, 2029/, 2031/
+# with near-identical filenames inside. Selecting an age group keeps matching from
+# picking another team's tape of the same opponent.
+AGE_PATTERNS = (re.compile(r'\b20([23]\d)\b'),     # "2029", "2029 red"
+                re.compile(r"'([23]\d)\b"),        # "3d ne '29"
+                re.compile(r'^([23]\d)s?$'))       # a folder named just "29" / "29s"
+
+
+def age_groups_of(text):
+    """Age-group years a folder or file NAME declares: "3d ne '29" -> {'2029'}.
+
+    Deliberately strict: a bare 2-digit number inside a longer name ("June 27",
+    "Great 8", "3d 29 vs X") is NOT a marker — dates and scores would poison it.
+    Only a 4-digit year, an apostrophe year, or a folder named just the year counts.
+    """
+    found = set()
+    for pat in AGE_PATTERNS:
+        found |= {f'20{m}' for m in pat.findall(text.strip())}
+    return found
+
+
+def video_age_groups(path):
+    """Every age group marked anywhere on this file's FULL path (folders + stem).
+
+    The full path, not the part under the chosen root: the year often lives in the
+    root folder's own name ("3d ne '29/..."), which rel_to_root strips away.
+    """
+    groups = set()
+    for part in Path(path).parts[:-1]:
+        groups |= age_groups_of(part)
+    groups |= age_groups_of(Path(path).stem)
+    return groups
+
+
+def list_age_groups(videos):
+    """Sorted age groups marked across these videos — the dropdown's choices."""
+    groups = set()
+    for v in videos:
+        groups |= video_age_groups(v)
+    return sorted(groups)
+
+
+def filter_age_group(videos, group):
+    """Videos for one age group: keeps files marked with it AND unmarked files.
+
+    A file marked only as a different year is definitively another team's tape;
+    an unmarked file might be this team's game filed loosely, so it must survive —
+    dropping it would hide the right answer, which folder evidence never gets to do.
+    """
+    if not group:
+        return videos
+    return [v for v in videos
+            if not (marks := video_age_groups(v)) or group in marks]
+
+
 def digits_fit(game_toks, digits, stem_toks, comp_toks):
     """Does this file carry the game's number as identity, not as coincidence?
 
@@ -1108,6 +1163,10 @@ def run_gui():
     ttk.Button(vid_btns, text='Add folder…', command=lambda: pick_videos()).pack(side='left')
     ttk.Button(vid_btns, text='Clear', width=6,
                command=lambda: clear_videos()).pack(side='left', padx=(4, 0))
+    # age-group picker — appears only when the scanned videos span several age groups
+    age_var = tk.StringVar(value='All age groups')
+    age_lbl = ttk.Label(vid_btns, text='Age:')
+    age_box = ttk.Combobox(vid_btns, textvariable=age_var, state='readonly', width=9)
     top.columnconfigure(1, weight=1)
 
     # --- middle: review table --------------------------------------------
@@ -1230,6 +1289,10 @@ def run_gui():
         gen_btn.configure(state='normal' if state['rows'] and state['videos'] else 'disabled')
         prev_btn.configure(state='normal' if state['rows'] else 'disabled')
 
+    def selected_age():
+        v = age_var.get()
+        return v if re.fullmatch(r'20\d\d', v) else ''
+
     def rematch():
         if state['rows'] and state['videos']:
             for r in state['rows']:
@@ -1240,8 +1303,35 @@ def run_gui():
                            and 'game name' not in f]
             exclude = state['sheet'].parent / 'clips' if state['sheet'] else None
             match_videos(state['rows'], state['videos'], exclude=exclude,
-                         videos=state['video_files'])
+                         videos=filter_age_group(state['video_files'], selected_age()))
         refresh_table()
+
+    def update_age_choices():
+        """Offer the dropdown only when it can actually disambiguate something."""
+        groups = list_age_groups(state['video_files'])
+        if len(groups) >= 2:
+            age_box.configure(values=['All age groups'] + groups)
+            saved = cfg.get('age_group', '')
+            age_var.set(saved if saved in groups else 'All age groups')
+            age_lbl.pack(side='left', padx=(10, 2))
+            age_box.pack(side='left')
+        else:
+            age_var.set('All age groups')
+            age_lbl.pack_forget()
+            age_box.pack_forget()
+
+    def on_age_change(_e=None):
+        cfg['age_group'] = selected_age()
+        save_settings(cfg)
+        group = selected_age()
+        if group:
+            n = len(filter_age_group(state['video_files'], group))
+            log(f'Age group {group}: matching against {n} of '
+                f'{len(state["video_files"])} videos')
+        else:
+            log(f'Age group filter off — matching against all {len(state["video_files"])} videos')
+        rematch()
+    age_box.bind('<<ComboboxSelected>>', on_age_change)
 
     def load_sheet(path):
         try:
@@ -1277,6 +1367,7 @@ def run_gui():
         if not state['videos']:
             state['video_files'] = []
             vid_lbl.configure(text='Video folders: (none yet — drop folders here or Add folder…)')
+            update_age_choices()
             refresh_table()
             return
         names = ', '.join(p.name or str(p) for p in state['videos'])
@@ -1284,6 +1375,7 @@ def run_gui():
         root.update_idletasks()
         state['video_files'] = list_videos(state['videos'])   # scanned once, reused by rematch
         vid_lbl.configure(text=f'Video folders: {names}  ({len(state["video_files"])} videos found)')
+        update_age_choices()
         rematch()
 
     def pick_videos():

@@ -7,11 +7,12 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 sys.stdout.reconfigure(encoding='utf-8')
-from chopper import (Row, build_xmeml, clean_team, find_columns, label_text,
-                     list_videos, match_score, match_videos, norm_tokens,
-                     opponent_tokens, parse_range, parse_sheet, parse_tc,
-                     place_kind, render_label_png, sanitize_filename,
-                     timeline_layout)
+from chopper import (Row, age_groups_of, build_xmeml, clean_team, filter_age_group,
+                     find_columns, label_text, list_age_groups, list_videos,
+                     match_score, match_videos, norm_tokens, opponent_tokens,
+                     parse_range, parse_sheet, parse_tc, place_kind,
+                     render_label_png, sanitize_filename, timeline_layout,
+                     video_age_groups)
 
 HERE = Path(__file__).parent
 
@@ -230,6 +231,43 @@ with tempfile.TemporaryDirectory() as td:
         match_videos([r], summer)
         assert r.src, game
         assert any('ambiguous' in f for f in r.flags), (game, r.flags)
+
+# --- age groups ---------------------------------------------------------------
+# One club, several age groups: each tournament folder holds 2027/…/2031 with
+# near-identical filenames. Selecting an age group must keep matching from
+# picking another team's tape of the same opponent.
+assert age_groups_of('2029') == {'2029'}
+assert age_groups_of('29') == {'2029'} and age_groups_of('29s') == {'2029'}
+assert age_groups_of("3d ne '29") == {'2029'}          # apostrophe year mid-name
+assert age_groups_of('3d NE Red 2029 vs 2Way') == {'2029'}
+assert age_groups_of('2027 tournament June 27') == {'2027'}
+# dates, scores, and jersey numbers must NOT read as age groups
+assert age_groups_of('June 27') == set()
+assert age_groups_of('Day 2') == set()
+assert age_groups_of('Great 8') == set()
+assert age_groups_of('3d 29 vs 91 Colorado Great 8') == set()   # bare 2-digit mid-name
+assert age_groups_of('91 georgia') == set()
+
+with tempfile.TemporaryDirectory() as td:
+    big = Path(td) / 'Club'
+    for tourn in ('Sweetlax', 'NAL'):
+        for year in ('2027', '2029', '2031'):
+            (big / tourn / year).mkdir(parents=True)
+            (big / tourn / year / 'vs sweetlax.mp4').touch()
+    (big / 'Sweetlax' / 'loose scrimmage.mp4').touch()   # no age marker anywhere
+    vids = list_videos(big)
+    assert list_age_groups(vids) == ['2027', '2029', '2031']
+    assert video_age_groups(big / 'Sweetlax' / '2029' / 'vs sweetlax.mp4') == {'2029'}
+    assert video_age_groups(big / 'Sweetlax' / 'loose scrimmage.mp4') == set()
+    kept = filter_age_group(vids, '2029')
+    # the other years' tapes are gone; unmarked files survive (they might be ours)
+    assert len(kept) == 3, kept                          # 2 x 2029 + the loose file
+    assert all('2027' not in str(v) and '2031' not in str(v) for v in kept)
+    assert filter_age_group(vids, '') == vids            # no selection = no filter
+    # end to end: same opponent in every age folder — the filter disambiguates
+    r_sw = Row(sheet_row=2, game='Sweetlax vs sweetlax', start=1.0, end=2.0)
+    match_videos([r_sw], big, videos=filter_age_group(vids, '2029'))
+    assert r_sw.src and '2029' in str(r_sw.src), r_sw.src
 
 # digit guard: "Game 2" must not match "Game 1.mp4" when Game 2's video is missing
 with tempfile.TemporaryDirectory() as td:

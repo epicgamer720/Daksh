@@ -19,6 +19,10 @@ Requires Python 3 from [python.org](https://python.org).
    searched, and folder names help identify games — so one big folder of tournament subfolders
    works, and a row for "Alliance vs Calvary" finds `Alliance/2027/vs calvary.mp4`. Add as many
    separate folders as you like; **Clear** starts over.
+   If your videos span several **age groups** (tournament folders holding `2027/`…`2031/`, or
+   folders named like `'29`), an **Age** dropdown appears — pick your team's year and matching
+   only considers that group's tapes (files with no year marked anywhere stay in play). Your
+   pick is remembered.
 3. Review the table. Red rows need attention. To assign a video by hand, select the row(s) —
    shift/ctrl-click for several — and hit **Assign video…** (or right-click). Hand-picked files
    are never overwritten by auto-matching; **Clear assignment** hands a row back to it.
