@@ -23,8 +23,15 @@ Requires Python 3 from [python.org](https://python.org).
    shift/ctrl-click for several — and hit **Assign video…** (or right-click). Hand-picked files
    are never overwritten by auto-matching; **Clear assignment** hands a row back to it.
    Double-click any In/Out/Label/Notes cell to edit it.
+   Click the **☑ column** (or select rows and press space) to toggle a clip **off** — its slot
+   stays as a **gap** in the timeline, so nothing after it shifts, and a marker names what
+   belongs in the hole. Rows with no video but a good timecode are left as gaps too.
 4. Optional: turn on **Add clip labels as text in the timeline** and pick your font file + size.
-5. **Generate** → import the `..._timeline.xml` into Premiere (File > Import). Clips appear in
+   Check **+ team** to append the opponent from the sheet ("Goal" → "Goal vs Sweetlax").
+   **Preview…** shows the label on a real frame from your footage — tune the size right there.
+5. **Preview timeline** shows the sequence — clips, gaps, thumbnails — before you ever open
+   Premiere. Click a block to select its row in the table.
+6. **Generate** → import the `..._timeline.xml` into Premiere (File > Import). Clips appear in
    order; labels sit on a second video track and stay editable. Keep the `labels/` folder —
    the timeline references it.
 

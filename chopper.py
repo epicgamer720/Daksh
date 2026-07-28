@@ -62,6 +62,7 @@ class Row:
     flags: list = field(default_factory=list)
     src: Path | None = None      # matched video file
     manual: bool = False         # user picked the file by hand — never auto-rematch
+    enabled: bool = True         # toggled off -> the clip's slot stays as a gap
 
 
 def parse_tc(text):
@@ -398,6 +399,78 @@ def match_videos(rows, folders, threshold=0.55, exclude=None, videos=None):
     return rows
 
 
+# ------------------------------------------------------- timeline placement
+
+def place_kind(r):
+    """'clip' = lands with footage, 'gap' = holds its length as empty track, None = no length.
+
+    A row toggled off — or missing its video — must keep its slot: dropping it would
+    shift every later clip earlier and wreck an edit planned around the sheet's order.
+    Only a row whose length is unknowable (no timecode, no probe-able file) is dropped.
+    """
+    timed = r.start is not None and r.end is not None and r.end > r.start
+    if r.enabled and r.src is not None and (r.whole_file or timed):
+        return 'clip'
+    if timed or (r.whole_file and r.src is not None):
+        return 'gap'
+    return None
+
+
+def timeline_layout(rows, probes=None):
+    """Where every row lands on the sequence, in seconds — the ONE place the timeline's
+    shape is decided. build_xmeml and the preview window both draw from this, so what
+    the preview shows is by construction what Premiere will import.
+
+    Returns [{'row', 'kind', 'start', 'end', 'dur', 't0'}]: source in/out, clip length,
+    and sequence position. A whole-file row not yet probed has end/dur of None — the
+    preview shows a placeholder until probing lands; generate() never passes one.
+    """
+    probes = probes or {}
+    segs, t = [], 0.0
+    for r in rows:
+        kind = place_kind(r)
+        if not kind:
+            continue
+        if r.whole_file:
+            p = probes.get(str(r.src)) if r.src else None
+            start, end = 0.0, (p['duration'] if p else None)
+        else:
+            start, end = r.start, r.end
+        dur = None if end is None else end - start
+        segs.append({'row': r, 'kind': kind, 'start': start, 'end': end,
+                     'dur': dur, 't0': t})
+        t += dur or 0.0
+    return segs
+
+
+# ------------------------------------------------------------------- labels
+
+def clean_team(game):
+    """Sheet game name -> the opponent as you'd caption it.
+
+    'Georgetown Prep #2 (Daksh )' -> 'Georgetown Prep #2', 'vs Legacy' -> 'Legacy'.
+    """
+    t = re.sub(r'\([^)]*\)', ' ', game)
+    t = re.sub(r'^\s*(?:vs|v)\.?\s+', '', t, flags=re.I)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def label_text(row, with_team=False):
+    """Overlay text for a row: the label, plus 'vs <team>' straight off the sheet.
+
+    A label that already names an opponent is left alone — 'Goal vs Sweetlax' must not
+    become 'Goal vs Sweetlax vs Sweetlax Upstate', even when the label abbreviates the
+    team. A row with no label still gets 'vs <team>' so every clip says who it was against.
+    """
+    if not with_team:
+        return row.label
+    team = clean_team(row.game) if row.game else ''
+    if not team or (row.label and (team.lower() in row.label.lower()
+                                   or re.search(r'\bvs\.?\s', row.label, re.I))):
+        return row.label
+    return f'{row.label} vs {team}' if row.label else f'vs {team}'
+
+
 # ------------------------------------------------------------------- ffmpeg
 
 def ensure_pip(module, pip_name):
@@ -507,6 +580,15 @@ def cut_clip(ffmpeg, row, out_path):
     subprocess.run(cmd, capture_output=True, text=True, check=True)
 
 
+def grab_frame(ffmpeg, src, sec, out_path, width=None):
+    """One frame at `sec` as a PNG — preview fodder. Source is only read."""
+    vf = ['-vf', f'scale={width}:-2'] if width else []
+    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', f'{max(sec, 0):.3f}', '-i', str(src), '-frames:v', '1',
+                    *vf, str(out_path)],
+                   capture_output=True, text=True, check=True)
+
+
 # ------------------------------------------------------------ label graphics
 
 def render_label_png(text, font_path, size, width, height, out_path):
@@ -543,20 +625,46 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
 
     rows: matched Rows (src set, times resolved); probes: {path_str: probe info}.
     Whole-file rows use the entire source. Notes become sequence markers.
-    label_pngs: optional {row_index: png_path} — full-frame stills laid on a second
-    video track above each clip (imports far more reliably than XML text generators).
+    Rows toggled off (or with no video but a known length) stay as GAPS: empty track
+    for exactly their duration, so nothing after them shifts, plus a marker naming
+    what belongs in the hole. Numbering counts gaps too — clip 07 stays 07 whether
+    or not 05 is toggled off.
+    label_pngs: optional {index_into_placeable_rows: png_path} — full-frame stills
+    laid on a second video track above each clip (imports far more reliably than
+    XML text generators).
     """
-    fps_list = [probes[str(r.src)]['fps'] for r in rows]
+    segs = timeline_layout(rows, probes)
+    clip_probes = [probes[str(s['row'].src)] for s in segs if s['kind'] == 'clip']
+    if not clip_probes:
+        raise ValueError('Every clip is toggled off or missing its video — '
+                         'the timeline would be all gap')
+    fps_list = [p['fps'] for p in clip_probes]
     seq_fps = max(set(fps_list), key=fps_list.count)
-    first = probes[str(rows[0].src)]
+    first = clip_probes[0]
 
     v_items, a_items, o_items, markers = [], [], [], []
     file_defs = {}   # path -> file id (emit full <file> once, then reference)
     png_defs = {}
     t = 0            # sequence playhead in frames
-    for n, r in enumerate(rows, 1):
+    for n, seg in enumerate(segs, 1):
+        r = seg['row']
+        start, end = seg['start'], seg['end']
+        if seg['dur'] is None:      # generate() probes every placed file; fail loud if not
+            raise ValueError(f'whole-file row "{r.label or r.game}" was never probed — '
+                             'cannot know how long its slot is')
+        dur = round(seg['dur'] * seq_fps)
+        name = escape(f'{n:02d} - {r.label or r.game}')
+        if seg['kind'] == 'gap':
+            # A toggled-off or videoless row still owns its slot: leave the track
+            # empty for its whole duration and drop a marker saying what goes there.
+            why = 'toggled off' if not r.enabled else 'no video'
+            note = f' — {r.notes}' if r.notes else ''
+            markers.append(f'<marker><name>{name}</name>'
+                           f'<comment>{escape(f"gap ({why}){note}")}</comment>'
+                           f'<in>{t}</in><out>-1</out></marker>')
+            t += dur
+            continue
         p = probes[str(r.src)]
-        start, end = (0.0, p['duration']) if r.whole_file else (r.start, r.end)
         # Every frame number ON THE CLIPITEM is read at the SEQUENCE rate, never at the
         # source's own rate, whatever <rate> the clipitem carries. Counting in/out in
         # source frames put every clip whose footage differs from the sequence at the
@@ -564,10 +672,8 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
         # late clip in a fast file pointed past the end of the media and imported as
         # nothing at all. Only footage that happened to match the sequence came in right.
         f_in, f_out = round(start * seq_fps), round(end * seq_fps)
-        dur = round((end - start) * seq_fps)
         clip_frames = round(p['duration'] * seq_fps)
         file_frames = round(p['duration'] * p['fps'])   # <file> stays in its own rate
-        name = escape(f'{n:02d} - {r.label or r.game}')
         path = str(r.src)
 
         if path not in file_defs:
@@ -649,33 +755,53 @@ def sanitize_filename(name):
 def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
     """Write timeline XML (+ optional clip files). Returns (xml_path, ok, failed).
 
-    labels_cfg: optional {'font': Path|None, 'size': int} — render each row's label
-    as a still-image overlay on a second timeline track.
+    Rows toggled off — or with no video but a known length — stay as gaps in the
+    timeline instead of shifting everything after them.
+    labels_cfg: optional {'font': Path|None, 'size': int, 'team': bool} — render each
+    row's label as a still-image overlay on a second timeline track; 'team' appends
+    'vs <game>' from the sheet.
     """
     ffmpeg, ffprobe = find_ffmpeg()
-    rows = [r for r in rows if r.src is not None and (r.whole_file or (
-        r.start is not None and r.end is not None and r.end > r.start))]
+    rows = [r for r in rows if place_kind(r)]
     if not rows:
         raise ValueError('No usable rows — every row is missing a video file or timecode')
 
-    log(f'Probing {len({str(r.src) for r in rows})} video file(s)...')
+    log(f'Probing {len({str(r.src) for r in rows if r.src})} video file(s)...')
     probes, unreadable = {}, set()
-    for path in {str(r.src) for r in rows}:
+    for path in {str(r.src) for r in rows if r.src}:
         try:
             probes[path] = probe(ffprobe, path)
         except Exception:
             unreadable.add(path)
-            log(f'WARNING: could not read {Path(path).name} — skipping its clips')
+            log(f'WARNING: could not read {Path(path).name}')
     for path, p in probes.items():
         if p['vfr']:
             log(f'NOTE: {Path(path).name} has a variable frame rate ({p["fps"]:.3f} fps '
                 f'average) — timeline positions use the measured rate. If clips still land '
                 f'late in Premiere, re-export this file at a constant frame rate.')
-    rows = [r for r in rows if str(r.src) not in unreadable]
-    if not rows:
-        raise ValueError('None of the matched video files could be read')
+    kept = []
+    for r in rows:
+        if r.src and str(r.src) in unreadable:
+            # an unreadable video must not shift every later clip — a timed row
+            # still knows its own length, so it holds its slot as a gap
+            r.src = None
+            if place_kind(r):
+                log(f'   ...its "{r.label or r.game}" clip stays as a gap in the timeline')
+                kept.append(r)
+            else:
+                log(f'   ...its "{r.label or r.game}" clip is skipped (no timecode)')
+            continue
+        kept.append(r)
+    rows = kept
+    if not any(place_kind(r) == 'clip' for r in rows):
+        raise ValueError('None of the matched video files could be read' if unreadable else
+                         'Every clip is toggled off or missing its video — '
+                         'the timeline would be all gap')
     kept = []
     for r in rows:  # enforce real durations now that we know them
+        if place_kind(r) != 'clip':
+            kept.append(r)      # gaps have no media to check
+            continue
         d = probes[str(r.src)]['duration']
         if r.whole_file or not d:
             kept.append(r)
@@ -689,16 +815,24 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
                 r.whole_file = True
                 kept.append(r)
                 continue
-            log(f'SKIPPED "{r.label or r.game}": starts at {fmt_tc(r.start)} but '
-                f'{r.src.name} is only {fmt_tc(d)} long — wrong video or wrong time?')
+            # Wrong video, but the row knows its own length — hold its slot as a gap,
+            # exactly like an unreadable file, so nothing after it shifts or renumbers.
+            log(f'"{r.label or r.game}" starts at {fmt_tc(r.start)} but {r.src.name} is '
+                f'only {fmt_tc(d)} long — wrong video or wrong time? Left as a gap')
+            r.src = None
+            kept.append(r)
             continue
         if r.end > d:
             log(f'NOTE: "{r.label or r.game}" trimmed to the end of {r.src.name}')
             r.end = d
         kept.append(r)
     rows = kept
-    if not rows:
+    clips = [r for r in rows if place_kind(r) == 'clip']
+    if not clips:
         raise ValueError('No usable rows left after checking video durations')
+    if len(clips) < len(rows):
+        log(f'{len(rows) - len(clips)} clip(s) left as gaps in the timeline '
+            '(toggled off or no video)')
 
     label_pngs = {}
     if labels_cfg:
@@ -709,24 +843,26 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
                 'Run: python3 -m pip install pillow')
             labels_cfg = None
     if labels_cfg:
-        first = probes[str(rows[0].src)]
+        team_on = bool(labels_cfg.get('team'))
+        first = probes[str(clips[0].src)]
         label_dir = out_dir / 'labels'
         label_dir.mkdir(exist_ok=True)
         by_text = {}
         for i, r in enumerate(rows):
-            if not r.label:
+            text = label_text(r, team_on) if place_kind(r) == 'clip' else ''
+            if not text:
                 continue
-            if r.label not in by_text:
-                png = label_dir / f'{sanitize_filename(r.label)}.png'
+            if text not in by_text:
+                png = label_dir / f'{sanitize_filename(text)}.png'
                 try:
-                    render_label_png(r.label, labels_cfg.get('font'), labels_cfg.get('size', 48),
+                    render_label_png(text, labels_cfg.get('font'), labels_cfg.get('size', 48),
                                      first['width'], first['height'], png)
-                    by_text[r.label] = png
+                    by_text[text] = png
                 except Exception as e:
-                    by_text[r.label] = None
-                    log(f'WARNING: could not render label "{r.label}": {e}')
-            if by_text[r.label]:
-                label_pngs[i] = by_text[r.label]
+                    by_text[text] = None
+                    log(f'WARNING: could not render label "{text}": {e}')
+            if by_text[text]:
+                label_pngs[i] = by_text[text]
         if label_pngs:
             log(f'{sum(1 for v in by_text.values() if v)} label graphic(s) written to labels/')
 
@@ -738,7 +874,12 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
     if export_clips:
         clip_dir = out_dir / 'clips'
         clip_dir.mkdir(exist_ok=True)
+        done = 0
+        # n numbers ALL rows, gaps included, so file names match the timeline's numbering
         for n, r in enumerate(rows, 1):
+            if place_kind(r) != 'clip':
+                continue
+            done += 1
             stem = sanitize_filename(f'{n:02d} - {r.label or "clip"} - {norm_tokens(r.game) and " ".join(norm_tokens(r.game)) or r.src.stem}')
             out_path = clip_dir / f'{stem}{r.src.suffix.lower() if r.whole_file else ".mp4"}'
             try:
@@ -746,11 +887,11 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
                 if not out_path.exists() or out_path.stat().st_size < 1000:
                     raise RuntimeError('ffmpeg produced an empty file')
                 ok += 1
-                log(f'[{n}/{len(rows)}] {out_path.name}')
+                log(f'[{done}/{len(clips)}] {out_path.name}')
             except Exception as e:
                 failed.append(r)
                 err = str(getattr(e, 'stderr', '') or e).strip()
-                log(f'[{n}/{len(rows)}] FAILED {out_path.name}: {err[:200]}')
+                log(f'[{done}/{len(clips)}] FAILED {out_path.name}: {err[:200]}')
     return xml_path, ok, failed
 
 
@@ -758,9 +899,11 @@ def estimate_clip_bytes(rows):
     """Rough output size at ~10 Mbps for cut clips, actual size for whole-file copies."""
     total = 0
     for r in rows:
-        if r.whole_file and r.src:
+        if place_kind(r) != 'clip':
+            continue            # gaps and toggled-off rows are never exported
+        if r.whole_file:
             total += r.src.stat().st_size
-        elif r.start is not None and r.end is not None and r.end > r.start:
+        else:
             total += int((r.end - r.start) * 1.25e6)
     return total
 
@@ -880,14 +1023,15 @@ def run_gui():
     # --- middle: review table --------------------------------------------
     mid = ttk.Frame(root, padding=(8, 0))
     mid.pack(fill='both', expand=True)
-    cols = ('order', 'game', 'file', 'in', 'out', 'label', 'notes', 'status')
+    cols = ('on', 'order', 'game', 'file', 'in', 'out', 'label', 'notes', 'status')
     tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='extended')
-    widths = {'order': 45, 'game': 180, 'file': 180, 'in': 70, 'out': 70,
-              'label': 170, 'notes': 180, 'status': 220}
+    widths = {'on': 34, 'order': 45, 'game': 180, 'file': 170, 'in': 70, 'out': 70,
+              'label': 160, 'notes': 170, 'status': 220}
     for c in cols:
         tree.heading(c, text=c.title())
         tree.column(c, width=widths[c], anchor='w')
     tree.tag_configure('bad', background='#ffd6d6')
+    tree.tag_configure('off', foreground='#999')
     ys = ttk.Scrollbar(mid, orient='vertical', command=tree.yview)
     tree.configure(yscrollcommand=ys.set)
     tree.pack(side='left', fill='both', expand=True)
@@ -914,11 +1058,12 @@ def run_gui():
     labels_var = tk.BooleanVar(value=cfg.get('labels_on', False))
     font_var = tk.StringVar(value=cfg.get('font', ''))
     size_var = tk.StringVar(value=str(cfg.get('size', 48)))
+    team_var = tk.BooleanVar(value=cfg.get('label_team', False))
     ttk.Checkbutton(bot, text='Add clip labels as text in the timeline',
                     variable=labels_var).grid(row=0, column=0, sticky='w')
     font_frame = ttk.Frame(bot)
     font_frame.grid(row=0, column=1, columnspan=2, sticky='w', padx=(10, 0))
-    font_lbl = ttk.Label(font_frame, width=26, anchor='w',
+    font_lbl = ttk.Label(font_frame, width=20, anchor='w',
                          text=Path(font_var.get()).name if font_var.get() else '(default font)')
     def pick_font():
         p = filedialog.askopenfilename(title='Label font',
@@ -930,14 +1075,23 @@ def run_gui():
     font_lbl.pack(side='left', padx=6)
     ttk.Label(font_frame, text='Size:').pack(side='left')
     ttk.Entry(font_frame, textvariable=size_var, width=4).pack(side='left', padx=(4, 0))
+    ttk.Checkbutton(font_frame, text='+ team ("Goal vs Sweetlax")',
+                    variable=team_var).pack(side='left', padx=(10, 0))
+    ttk.Button(font_frame, text='Preview…',
+               command=lambda: preview_label()).pack(side='left', padx=(8, 0))
 
     export_var = tk.BooleanVar(value=cfg.get('export_clips', True))
     ttk.Style().configure('Big.TCheckbutton', font=('TkDefaultFont', 10, 'bold'))
     export_chk = ttk.Checkbutton(bot, text='Make individual clip files',
                                  variable=export_var, style='Big.TCheckbutton')
     export_chk.grid(row=1, column=0, sticky='w', pady=(6, 0))
-    gen_btn = ttk.Button(bot, text='Generate', state='disabled', command=lambda: start_generate())
-    gen_btn.grid(row=1, column=1, padx=10, pady=(6, 0))
+    btns = ttk.Frame(bot)
+    btns.grid(row=1, column=1, padx=10, pady=(6, 0))
+    prev_btn = ttk.Button(btns, text='Preview timeline', state='disabled',
+                          command=lambda: preview_timeline())
+    prev_btn.pack(side='left')
+    gen_btn = ttk.Button(btns, text='Generate', state='disabled', command=lambda: start_generate())
+    gen_btn.pack(side='left', padx=(6, 0))
     prog = ttk.Progressbar(bot, mode='determinate')
     prog.grid(row=1, column=2, sticky='ew', padx=(0, 4), pady=(6, 0))
     bot.columnconfigure(2, weight=1)
@@ -963,15 +1117,17 @@ def run_gui():
         keep = tree.selection()
         tree.delete(*tree.get_children())
         for i, r in enumerate(state['rows']):
-            vals = (r.order if r.order is not None else '',
+            vals = ('☑' if r.enabled else '☐',
+                    r.order if r.order is not None else '',
                     r.game,
                     r.src.name if r.src else '',
                     'whole file' if r.whole_file else fmt_tc(r.start),
                     'whole file' if r.whole_file else fmt_tc(r.end),
                     r.label, r.notes,
-                    '; '.join(r.flags) if r.flags else 'ok')
+                    'off — stays as a gap in the timeline' if not r.enabled
+                    else '; '.join(r.flags) if r.flags else 'ok')
             tree.insert('', 'end', iid=str(i), values=vals,
-                        tags=('bad',) if r.flags else ())
+                        tags=('off',) if not r.enabled else ('bad',) if r.flags else ())
         still = [i for i in keep if tree.exists(i)]
         if still:
             tree.selection_set(still)
@@ -982,6 +1138,7 @@ def run_gui():
             log(f'{len(state["rows"])} clips parsed'
                 + (f', {n_bad} need review (red rows — double-click to fix)' if n_bad else ', all ok'))
         gen_btn.configure(state='normal' if state['rows'] and state['videos'] else 'disabled')
+        prev_btn.configure(state='normal' if state['rows'] else 'disabled')
 
     def rematch():
         if state['rows'] and state['videos']:
@@ -1084,11 +1241,32 @@ def run_gui():
         rematch()   # let auto-matching have another go at them
         log(f'Cleared {len(rows_sel)} assignment(s)')
 
+    def toggle_rows(rows_sel):
+        if not rows_sel:
+            log('Select a row in the table first')
+            return
+        turn_on = not rows_sel[0].enabled     # first row decides, so a mixed batch settles
+        for r in rows_sel:
+            r.enabled = turn_on
+        refresh_table()
+
+    def on_toggle_click(event):
+        """Click the ☑ column to toggle a clip off — it stays as a gap in the timeline."""
+        if tree.identify('region', event.x, event.y) != 'cell':
+            return
+        if tree.identify_column(event.x) != '#1':
+            return
+        item = tree.identify_row(event.y)
+        if item and item.isdigit():
+            toggle_rows([state['rows'][int(item)]])
+
     def on_right_click(event):
         item = tree.identify_row(event.y)
         if item and item not in tree.selection():
             tree.selection_set(item)
         menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label='Toggle clip on/off (leaves a gap)',
+                         command=lambda: toggle_rows(selected_rows()))
         menu.add_command(label='Assign video to selected row(s)…', command=assign_selected)
         menu.add_command(label='Clear assignment', command=unassign_selected)
         menu.tk_popup(event.x_root, event.y_root)
@@ -1144,12 +1322,23 @@ def run_gui():
         entry.bind('<Escape>', lambda e: entry.destroy())
 
     def start_generate():
-        usable = [r for r in state['rows'] if r.src and (r.whole_file or
-                  (r.start is not None and r.end is not None and r.end > r.start))]
-        skipped = len(state['rows']) - len(usable)
-        if skipped and not messagebox.askyesno(
-                'Some rows will be skipped',
-                f'{skipped} row(s) still have problems and will be left out.\nContinue with {len(usable)}?'):
+        placeable = [r for r in state['rows'] if place_kind(r)]
+        clips = [r for r in placeable if place_kind(r) == 'clip']
+        auto_gap = [r for r in placeable if r.enabled and place_kind(r) == 'gap']
+        dropped = len(state['rows']) - len(placeable)
+        if not clips:
+            log('Nothing to generate — every clip is toggled off or missing its video')
+            return
+        warn = []
+        if auto_gap:
+            warn.append(f'{len(auto_gap)} row(s) have no video — '
+                        'they will be left as gaps in the timeline.')
+        if dropped:
+            warn.append(f"{dropped} row(s) can't be placed at all — no valid In/Out times "
+                        'and no whole-file video — left out entirely.')
+        if warn and not messagebox.askyesno(
+                'Some rows have problems',
+                '\n'.join(warn) + f'\nContinue with {len(clips)} clip(s)?'):
             return
         out_dir = state['sheet'].parent
         tmp = Path(tempfile.gettempdir())
@@ -1159,8 +1348,8 @@ def run_gui():
                 return
             out_dir = Path(p)
         gen_btn.configure(state='disabled')
-        prog.configure(maximum=max(len(usable), 1), value=0)
-        work_rows = copy.deepcopy(usable)  # worker gets its own rows; table edits can't race it
+        prog.configure(maximum=max(len(clips), 1), value=0)
+        work_rows = copy.deepcopy(placeable)  # worker gets its own rows; table edits can't race it
         name = state['sheet'].stem.replace('_', ' ')
         export = export_var.get()
 
@@ -1174,9 +1363,9 @@ def run_gui():
             if lfont and not lfont.exists():
                 log(f'Font file not found ({lfont}) — using default font')
                 lfont = None
-            labels_cfg = {'font': lfont, 'size': lsize}
+            labels_cfg = {'font': lfont, 'size': lsize, 'team': team_var.get()}
         cfg.update({'labels_on': labels_var.get(), 'font': font_var.get(),
-                    'size': lsize, 'export_clips': export})
+                    'size': lsize, 'export_clips': export, 'label_team': team_var.get()})
         save_settings(cfg)
 
         def work():
@@ -1200,7 +1389,270 @@ def run_gui():
 
         threading.Thread(target=work, daemon=True).start()
 
+    def preview_timeline():
+        """Draw the sequence as it will import — clips, gaps, thumbnails — no Premiere needed.
+
+        Uses the same timeline_layout() the XML builder uses, so what this shows is by
+        construction what Generate writes.
+        """
+        win = tk.Toplevel(root)
+        win.title('Timeline preview')
+        win.geometry('1020x270')
+        alive = {'ok': True, 'tdir': None}
+        thumbs = {}                       # id(row) -> PhotoImage; ref MUST live on
+        win._thumb_refs = thumbs          # or Tk garbage-collects the images off the canvas
+        info = ttk.Label(win, anchor='w', padding=(8, 4))
+        info.pack(side='bottom', fill='x')
+        xs = ttk.Scrollbar(win, orient='horizontal')
+        canvas = tk.Canvas(win, height=200, background='#20242a', highlightthickness=0,
+                           xscrollcommand=xs.set)
+        xs.configure(command=canvas.xview)
+        xs.pack(side='bottom', fill='x')
+        canvas.pack(fill='both', expand=True)
+
+        def known_probes(rows):
+            return {str(r.src): _probe_cache[str(r.src)] for r in rows
+                    if r.src and str(r.src) in _probe_cache}
+
+        def draw():
+            if not alive['ok']:
+                return
+            canvas.delete('all')
+            rows = state['rows']          # read live: table edits and reloads show up
+            rowpos = {id(r): i for i, r in enumerate(rows)}
+            segs = timeline_layout(rows, known_probes(rows))
+            dropped = sum(1 for r in rows if not place_kind(r))
+            if not segs:
+                canvas.create_text(20, 40, anchor='w', fill='#ccc',
+                                   text='Nothing to place yet — match or assign videos first')
+                return
+            durs = [s['dur'] if s['dur'] is not None else 10.0 for s in segs]
+            total = sum(durs)
+            px = min(40.0, max(3.0, (canvas.winfo_width() - 40) / max(total, 1)))
+            y0, y1 = 42, 158
+            # ruler: ticks at a step that keeps labels ~70px apart
+            step = next((s for s in (1, 2, 5, 10, 15, 30, 60, 120, 300, 600)
+                         if s * px >= 70), 600)
+            for sec in range(0, int(total) + 1, step):
+                x = 16 + sec * px
+                canvas.create_line(x, 26, x, y0 - 4, fill='#555')
+                canvas.create_text(x + 2, 18, anchor='w', text=fmt_tc(sec),
+                                   fill='#888', font=('TkDefaultFont', 8))
+            x = 16.0
+            for i, s in enumerate(segs):
+                r, w, tag = s['row'], durs[i] * px, f'seg{i}'
+                if s['kind'] == 'gap':
+                    canvas.create_rectangle(x, y0, x + w, y1, fill='#2b2b2b',
+                                            outline='#666', dash=(3, 2), tags=tag)
+                    if w > 30:
+                        canvas.create_text(x + w / 2, (y0 + y1) / 2, text='GAP',
+                                           fill='#999', tags=tag)
+                else:
+                    canvas.create_rectangle(x, y0, x + w, y1, fill='#2f5d8f',
+                                            outline='#7aa7d6', tags=tag)
+                    img = thumbs.get(id(r))
+                    if img and w > img.width() + 6:
+                        canvas.create_image(x + 3, y0 + 3, image=img, anchor='nw', tags=tag)
+                    maxch = int(w / 6.5)
+                    if maxch >= 4:
+                        canvas.create_text(x + 4, y1 - 28, anchor='nw', fill='white',
+                                           text=f'{i + 1:02d} {r.label or r.game}'[:maxch],
+                                           font=('TkDefaultFont', 9), tags=tag)
+                        detail = ('whole file' if s['dur'] is None else
+                                  f'{fmt_tc(s["start"])}–{fmt_tc(s["end"])}')
+                        canvas.create_text(x + 4, y1 - 14, anchor='nw', fill='#bcd3e8',
+                                           text=f'{detail} · {r.src.name}'[:maxch],
+                                           font=('TkDefaultFont', 8), tags=tag)
+                pos = rowpos.get(id(r))
+                if pos is not None:
+                    def pick(_e, p=pos):
+                        if tree.exists(str(p)):
+                            tree.selection_set(str(p))
+                            tree.see(str(p))
+                    canvas.tag_bind(tag, '<Button-1>', pick)
+                x += w
+            canvas.configure(scrollregion=(0, 0, x + 16, 200))
+            nclips = sum(1 for s in segs if s['kind'] == 'clip')
+            info.configure(text=f'{fmt_tc(total)} total · {nclips} clip(s) · '
+                                f'{len(segs) - nclips} gap(s)'
+                           + (f' · {dropped} row(s) not placeable (no video or timecode)'
+                              if dropped else '')
+                           + ' — click a block to select its row')
+
+        def add_thumb(row_id, png):
+            if not alive['ok']:
+                return
+            try:
+                # keyed by row identity, not position: table edits while thumbnails
+                # stream in must not attach a frame to the wrong clip
+                thumbs[row_id] = tk.PhotoImage(file=str(png))   # main thread only
+            except tk.TclError:
+                return
+            draw()
+
+        def worker():
+            try:
+                ffmpeg, ffprobe = find_ffmpeg()
+            except Exception as e:
+                log(f'Preview: {e}')
+                return
+            rows = state['rows']          # snapshot; thumbs keyed by identity stay right
+            # durations for whole-file rows first, so block widths become real
+            for r in rows:
+                if not alive['ok']:
+                    return
+                if r.src and r.whole_file and str(r.src) not in _probe_cache:
+                    try:
+                        probe(ffprobe, r.src)
+                    except Exception:
+                        continue
+                    root.after(0, draw)
+            tdir = Path(tempfile.mkdtemp(prefix='chop_preview_'))
+            alive['tdir'] = tdir
+            if not alive['ok']:           # closed while we were probing
+                shutil.rmtree(tdir, ignore_errors=True)
+                return
+            for i, s in enumerate(timeline_layout(rows, known_probes(rows))):
+                if not alive['ok']:
+                    return
+                if s['kind'] != 'clip':
+                    continue
+                sec = s['start'] + (s['dur'] or 0) / 2    # mid-clip: the play, not the whistle
+                png = tdir / f'{i}.png'
+                try:
+                    grab_frame(ffmpeg, s['row'].src, sec, png, width=96)
+                except Exception:
+                    continue
+                root.after(0, add_thumb, id(s['row']), png)
+
+        job = {'id': None}
+
+        def on_configure(_e):
+            if not alive['ok']:
+                return
+            if job['id']:
+                win.after_cancel(job['id'])
+            job['id'] = win.after(120, draw)
+
+        def on_close():
+            alive['ok'] = False
+            win.destroy()
+            if alive['tdir']:
+                shutil.rmtree(alive['tdir'], ignore_errors=True)
+        win.protocol('WM_DELETE_WINDOW', on_close)
+        win.bind('<Configure>', on_configure)
+        win.bind('<Escape>', lambda e: on_close())
+        draw()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def preview_label():
+        """Show the label text on a real frame at the current font/size — tune before Generate."""
+        team_on = team_var.get()
+        sel = [r for r in selected_rows() if r.src]
+        cand = (sel or [r for r in state['rows'] if r.src and label_text(r, team_on)]
+                or [r for r in state['rows'] if r.src])
+        if not cand:
+            log('Load your spreadsheet and videos first — no clip to grab a frame from')
+            return
+        r = cand[0]
+        win = tk.Toplevel(root)
+        win.title('Label preview')
+        alive = {'ok': True}
+        holder = {'photo': None, 'frame': None, 'n': 0}   # photo ref must outlive configure()
+        img_lbl = ttk.Label(win, text='Grabbing a frame…', anchor='center')
+        img_lbl.pack(fill='both', expand=True, padx=8, pady=(8, 0))
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(side='bottom', fill='x')
+        ttk.Label(bar, text='Size:').pack(side='left')
+
+        def render_pass(n):
+            """Off the UI thread: composite label onto the cached frame, then hand back."""
+            if holder['n'] != n or not holder['frame'] or not alive['ok']:
+                return
+            frame_png, w, h, tdir = holder['frame']
+            try:
+                from PIL import Image
+                text = label_text(r, team_var.get())
+                try:
+                    size = max(8, int(float(size_var.get())))
+                except ValueError:
+                    size = 48
+                base = Image.open(frame_png).convert('RGBA')
+                if text:
+                    lbl_png = tdir / 'label.png'
+                    font = Path(font_var.get()) if font_var.get() else None
+                    render_label_png(text, font, size, w, h, lbl_png)
+                    base = Image.alpha_composite(base, Image.open(lbl_png).convert('RGBA'))
+                scale = min(880 / base.width, 500 / base.height, 1.0)
+                view = tdir / f'view{n}.png'
+                base.resize((round(base.width * scale), round(base.height * scale))).save(view)
+
+                def show():
+                    if holder['n'] != n or not alive['ok']:
+                        return
+                    try:
+                        holder['photo'] = tk.PhotoImage(file=str(view))
+                        img_lbl.configure(image=holder['photo'], text='')
+                        win.title(f'Label preview — "{text}" at size {size}'
+                                  if text else 'Label preview — (this row has no label)')
+                    except tk.TclError:
+                        pass
+                root.after(0, show)
+            except Exception as e:
+                # bind the message NOW: `e` is unbound once the except block exits,
+                # and the lambda runs later on the Tk main loop
+                msg = f'Could not render preview: {e}'
+                root.after(0, lambda m=msg: alive['ok'] and img_lbl.configure(text=m, image=''))
+
+        def schedule(*_):
+            holder['n'] += 1
+            n = holder['n']
+            win.after(250, lambda: holder['n'] == n and threading.Thread(
+                target=render_pass, args=(n,), daemon=True).start())
+
+        spin = ttk.Spinbox(bar, from_=8, to=300, increment=4, textvariable=size_var,
+                           width=5, command=schedule)
+        spin.pack(side='left', padx=(4, 0))
+        spin.bind('<KeyRelease>', schedule)
+        ttk.Checkbutton(bar, text='+ team', variable=team_var,
+                        command=schedule).pack(side='left', padx=(10, 0))
+        ttk.Button(bar, text='Font…',
+                   command=lambda: (pick_font(), schedule())).pack(side='left', padx=(10, 0))
+        ttk.Label(bar, foreground='#666',
+                  text='(size is saved — Generate uses exactly this)').pack(side='left', padx=(10, 0))
+
+        def first_grab():
+            try:
+                ffmpeg, ffprobe = find_ffmpeg()
+                p = probe(ffprobe, r.src)
+                ensure_pip('PIL', 'pillow')
+                if r.start is not None and r.end is not None:
+                    sec = (r.start + r.end) / 2           # mid-clip: the play, not the whistle
+                else:
+                    sec = min(60.0, (p['duration'] or 0) / 2)
+                tdir = Path(tempfile.mkdtemp(prefix='chop_label_'))
+                holder['tdir'] = tdir
+                frame_png = tdir / 'frame.png'
+                grab_frame(ffmpeg, r.src, sec, frame_png)
+                holder['frame'] = (frame_png, p['width'], p['height'], tdir)
+                holder['n'] += 1
+                render_pass(holder['n'])
+            except Exception as e:
+                msg = f'Could not grab a frame from {r.src.name}: {e}'   # e dies with the block
+                root.after(0, lambda m=msg: alive['ok'] and img_lbl.configure(text=m))
+
+        def on_close():
+            alive['ok'] = False
+            win.destroy()
+            if holder.get('tdir'):
+                shutil.rmtree(holder['tdir'], ignore_errors=True)
+        win.protocol('WM_DELETE_WINDOW', on_close)
+        win.bind('<Escape>', lambda e: on_close())
+        threading.Thread(target=first_grab, daemon=True).start()
+
     tree.bind('<Double-1>', on_double_click)
+    tree.bind('<Button-1>', on_toggle_click, add='+')
+    tree.bind('<space>', lambda e: toggle_rows(selected_rows()))
     tree.bind('<Button-3>', on_right_click)     # Windows/Linux right-click
     tree.bind('<Button-2>', on_right_click)     # macOS right-click / two-finger tap
     if has_dnd:
@@ -1232,6 +1684,8 @@ def run_gui():
     drain_log()
     log('1) Load your spreadsheet   2) Add your video folder(s) — subfolders are searched too'
         '   3) Review the table   4) Generate')
+    log('Click the ☑ column (or select rows and press space) to toggle a clip off — '
+        'its slot stays as a gap in the timeline.')
     if has_dnd:
         log('Drag and drop is ON — drop your sheet or video folders anywhere in this window.')
     else:

@@ -7,9 +7,11 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 sys.stdout.reconfigure(encoding='utf-8')
-from chopper import (Row, build_xmeml, find_columns, list_videos, match_score,
-                     match_videos, norm_tokens, opponent_tokens, parse_range,
-                     parse_sheet, parse_tc, render_label_png, sanitize_filename)
+from chopper import (Row, build_xmeml, clean_team, find_columns, label_text,
+                     list_videos, match_score, match_videos, norm_tokens,
+                     opponent_tokens, parse_range, parse_sheet, parse_tc,
+                     place_kind, render_label_png, sanitize_filename,
+                     timeline_layout)
 
 HERE = Path(__file__).parent
 
@@ -302,6 +304,91 @@ assert 'file://localhost/' in full_defs[0].find('pathurl').text
 marker = root.find('sequence/marker')
 assert marker is not None and marker.find('comment').text == 'speed up'
 
+# --- team names on labels ----------------------------------------------------
+# "Goal" + game "Sweetlax Upstate" -> "Goal vs Sweetlax Upstate", straight off the sheet.
+assert label_text(Row(sheet_row=2, label='Goal', game='Sweetlax Upstate')) == 'Goal'
+assert label_text(Row(sheet_row=2, label='Goal', game='Sweetlax Upstate'), True) == \
+    'Goal vs Sweetlax Upstate'
+assert clean_team('Georgetown Prep #2 (Daksh )') == 'Georgetown Prep #2'
+assert clean_team('vs Legacy') == 'Legacy'          # sheet already says "vs" — don't double it
+assert label_text(Row(sheet_row=2, label='Save', game='vs Legacy'), True) == 'Save vs Legacy'
+assert label_text(Row(sheet_row=2, label='Goal vs Sweetlax', game='Sweetlax'), True) == \
+    'Goal vs Sweetlax'                              # label already names the team
+assert label_text(Row(sheet_row=2, label='Goal vs Sweetlax', game='Sweetlax Upstate'), True) == \
+    'Goal vs Sweetlax'                              # ...even when it abbreviates the team
+assert label_text(Row(sheet_row=2, label='', game='2way'), True) == 'vs 2way'
+assert label_text(Row(sheet_row=2, label='Goal', game=''), True) == 'Goal'
+
+# --- toggled-off clips leave gaps ---------------------------------------------
+# A clip toggled off — or one with no video but a known length — must hold its slot:
+# dropping it would shift every later clip earlier and wreck the planned edit.
+r_on = Row(sheet_row=2, game='A', label='Goal', start=10.0, end=15.0, src=fake)
+r_off = Row(sheet_row=3, game='B', start=100.0, end=112.0, src=fake, enabled=False)
+r_novid = Row(sheet_row=4, game='C', start=5.0, end=9.0)      # no video matched
+r_wf = Row(sheet_row=5, game='F', whole_file=True, src=fake, enabled=False)
+r_hopeless = Row(sheet_row=6, game='D')                        # no video AND no times
+r_last = Row(sheet_row=7, game='E', start=20.0, end=26.0, src=fake)
+assert place_kind(r_on) == 'clip'
+assert place_kind(r_off) == 'gap'
+assert place_kind(r_novid) == 'gap'
+assert place_kind(r_wf) == 'gap'                   # off whole-file: gap of the file's length
+assert place_kind(r_hopeless) is None
+
+grows = [r_on, r_off, r_novid, r_wf, r_hopeless, r_last]
+segs = timeline_layout(grows, probes)
+assert [s['kind'] for s in segs] == ['clip', 'gap', 'gap', 'gap', 'clip']
+assert segs[1]['t0'] == 5.0 and segs[1]['dur'] == 12.0
+assert segs[3]['t0'] == 21.0 and segs[3]['dur'] == 100.0   # whole-file gap = probed length
+assert segs[4]['t0'] == 121.0                      # 5 + 12 + 4 + 100: every gap held its slot
+
+xml_g = build_xmeml(grows, probes, 'Gaps',
+                    {4: Path('lbl.png')})          # index into PLACEABLE rows -> r_last
+gr = ET.fromstring(xml_g)
+gitems = gr.findall('.//video/track')[0].findall('clipitem')   # track 1: the footage
+assert len(gitems) == 2                            # only real clips carry footage
+fps = 29.97
+gap_frames = round(5 * fps) + round(12 * fps) + round(4 * fps) + round(100 * fps)
+# the second clip starts after clip1 + all three gaps — nothing shifted earlier
+assert gitems[1].find('start').text == str(gap_frames)
+assert gitems[1].find('end').text == str(gap_frames + round(6 * fps))
+# numbering counts gaps (toggling 02 off cannot renumber 05); note a row whose length
+# is unknowable (r_hopeless) IS still dropped and does renumber what follows — the
+# Generate dialog warns about exactly those rows
+assert gitems[0].find('name').text.startswith('01 - ')
+assert gitems[1].find('name').text.startswith('05 - ')
+# each gap leaves a marker saying what belongs in the hole
+gmarks = gr.findall('sequence/marker')
+assert any('02 - B' in m.find('name').text and 'toggled off' in m.find('comment').text
+           for m in gmarks), [ET.tostring(m) for m in gmarks]
+assert any('03 - C' in m.find('name').text and 'no video' in m.find('comment').text
+           for m in gmarks)
+assert any('04 - F' in m.find('name').text and 'toggled off' in m.find('comment').text
+           for m in gmarks)
+# the gap marker sits at the gap's start on the sequence
+mk = next(m for m in gmarks if '02 - B' in m.find('name').text)
+assert mk.find('in').text == str(round(5 * fps))
+# audio track skips gaps too, and the label PNG landed on the right clip (05)
+assert len(gr.findall('.//audio/track/clipitem')) == 2
+overlay = gr.findall('.//video/track')[1].findall('clipitem')
+assert len(overlay) == 1 and overlay[0].find('name').text.startswith('05 - ')
+# sequence runs the full length including gaps
+assert gr.find('sequence/duration').text == str(gap_frames + round(6 * fps))
+# all clips toggled off -> a clear error, not a broken timeline
+try:
+    build_xmeml([r_off], probes, 'x')
+    assert False, 'expected ValueError'
+except ValueError:
+    pass
+# a whole-file row that was never probed has no knowable length -> loud error,
+# not a TypeError or a silently wrong timeline
+try:
+    build_xmeml([r_on, Row(sheet_row=8, game='G', whole_file=True,
+                           src=Path('never_probed.mp4'), enabled=False)],
+                probes, 'x')
+    assert False, 'expected ValueError'
+except ValueError as e:
+    assert 'probed' in str(e)
+
 # --- mixed frame rates on one timeline ---------------------------------------
 # Premiere reads every frame number on a clipitem at the SEQUENCE rate, whatever <rate>
 # the clipitem carries. Counting in/out in source frames sent 29.97 film to half its
@@ -336,6 +423,34 @@ for item, row in zip(mroot.findall('.//video/track/clipitem'), mixed_rows):
 fast_def = [f for f in mroot.findall('.//file')
             if f.find('name') is not None and f.find('name').text == 'fast.mp4'][0]
 assert fast_def.find('rate/timebase').text == '120', ET.tostring(fast_def.find('rate'))
+
+# --- generate(): a wrong-length video becomes a gap, not a silent shift ------
+# Matching picked a file that's too short for the row's times. The row's length is
+# still known, so it must hold its slot — the preview and the XML must agree.
+import chopper as _ch
+_orig_probe, _orig_ff = _ch.probe, _ch.find_ffmpeg
+_ch.find_ffmpeg = lambda: ('ffmpeg', 'ffprobe')
+_ch.probe = lambda fp, path: {'fps': 30.0, 'width': 1920, 'height': 1080,
+                              'duration': 2400.0, 'has_audio': True, 'vfr': False}
+try:
+    with tempfile.TemporaryDirectory() as td:
+        vid = Path(td) / 'a.mp4'
+        g_rows = [Row(sheet_row=2, game='A', start=0.0, end=5.0, src=vid),
+                  Row(sheet_row=3, game='B', start=3000.0, end=3020.0, src=vid),  # past 2400s
+                  Row(sheet_row=4, game='C', start=20.0, end=26.0, src=vid)]
+        msgs = []
+        xmlp, ok, failed = _ch.generate(g_rows, Path(td), 'GapGen', False, msgs.append)
+        rg = ET.fromstring(xmlp.read_text())
+        items = rg.findall('.//video/track')[0].findall('clipitem')
+        assert [i.find('name').text[:2] for i in items] == ['01', '03'], \
+            [i.find('name').text for i in items]
+        # C still starts after A + B's 20s slot — B became a gap, nothing shifted
+        assert items[1].find('start').text == str(round(5 * 30.0) + round(20 * 30.0))
+        assert any('gap' in (m.find('comment').text or '')
+                   for m in rg.findall('sequence/marker'))
+        assert any('Left as a gap' in m for m in msgs), msgs
+finally:
+    _ch.probe, _ch.find_ffmpeg = _orig_probe, _orig_ff
 
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 
