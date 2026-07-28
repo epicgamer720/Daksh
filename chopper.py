@@ -413,19 +413,36 @@ def find_ffmpeg():
 _probe_cache = {}
 
 
+def _fraction(text):
+    """'30000/1001' -> 29.97002997, or 0.0 if unusable."""
+    num, _, den = (text or '').partition('/')
+    try:
+        fps = float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    return fps if 1.0 <= fps <= 240.0 else 0.0
+
+
 def probe(ffprobe, path):
-    """Return {'fps', 'width', 'height', 'duration', 'has_audio'} for a video."""
+    """Return {'fps', 'width', 'height', 'duration', 'has_audio', 'vfr'} for a video.
+
+    Timeline in/out points are frame numbers, so a wrong fps puts every clip at the
+    wrong TIME in Premiere — and the error grows the deeper into the game you go
+    (reporting 30 for 29.97 footage is +3s an hour in). Variable-frame-rate and
+    concatenated files are where the nominal rate lies, so prefer the real average.
+    """
     path = str(path)
     if path in _probe_cache:
         return _probe_cache[path]
     out = subprocess.run(
         [ffprobe, '-v', 'error', '-show_entries',
-         'stream=codec_type,width,height,r_frame_rate,duration'
+         'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration,nb_frames'
          ':stream_disposition=attached_pic:format=duration',
          '-of', 'json', path],
         capture_output=True, text=True, check=True).stdout
     data = json.loads(out)
-    info = {'fps': 30.0, 'width': 1920, 'height': 1080, 'duration': 0.0, 'has_audio': False}
+    info = {'fps': 30.0, 'width': 1920, 'height': 1080, 'duration': 0.0,
+            'has_audio': False, 'vfr': False}
     if fd := data.get('format', {}).get('duration'):
         info['duration'] = float(fd)
     got_video = False
@@ -435,15 +452,20 @@ def probe(ffprobe, path):
                 continue  # embedded cover art, not the footage
             if 'width' in s:
                 info['width'], info['height'] = s['width'], s['height']
-            num, _, den = s.get('r_frame_rate', '').partition('/')
-            try:
-                fps = float(num) / float(den or 1)
-            except (ValueError, ZeroDivisionError):
-                fps = 0.0
-            if 1.0 <= fps <= 240.0:
-                info['fps'] = fps
+            nominal = _fraction(s.get('r_frame_rate'))
+            average = _fraction(s.get('avg_frame_rate'))
             if not info['duration'] and s.get('duration'):
                 info['duration'] = float(s['duration'])
+            # frames / seconds is ground truth when the container offers it
+            try:
+                measured = int(s['nb_frames']) / info['duration']
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                measured = 0.0
+            measured = measured if 1.0 <= measured <= 240.0 else 0.0
+            real = average or measured or nominal
+            if nominal and real and abs(real - nominal) / nominal > 0.005:
+                info['vfr'] = True          # nominal rate lies; trust the average
+            info['fps'] = real or nominal or 30.0
             got_video = True
         elif s.get('codec_type') == 'audio':
             info['has_audio'] = True
@@ -616,6 +638,11 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
         except Exception:
             unreadable.add(path)
             log(f'WARNING: could not read {Path(path).name} — skipping its clips')
+    for path, p in probes.items():
+        if p['vfr']:
+            log(f'NOTE: {Path(path).name} has a variable frame rate ({p["fps"]:.3f} fps '
+                f'average) — timeline positions use the measured rate. If clips still land '
+                f'late in Premiere, re-export this file at a constant frame rate.')
     rows = [r for r in rows if str(r.src) not in unreadable]
     if not rows:
         raise ValueError('None of the matched video files could be read')

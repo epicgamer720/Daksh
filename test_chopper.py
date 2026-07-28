@@ -292,6 +292,61 @@ chopper.TRACK_URL = ''   # deliberately NOT restored: nothing after this may pin
 srv.shutdown()
 assert orig_track_url is not None  # silence unused warning; original stays blanked
 
+# --- frame rate detection ----------------------------------------------------
+# A wrong fps puts every timeline clip at the wrong TIME, drifting further the deeper
+# into the game. Concatenated/VFR footage is where the nominal rate lies.
+import json as _json
+import subprocess as _sub
+from chopper import _fraction, probe
+
+assert _fraction('30000/1001') == 30000 / 1001
+assert _fraction('30/1') == 30.0
+assert _fraction('0/0') == 0.0            # ffprobe's "unknown"
+assert _fraction('90000/1') == 0.0        # cover-art nonsense rate
+assert _fraction(None) == 0.0
+
+
+def _fake_probe(streams, duration='3600.0'):
+    payload = _json.dumps({'streams': streams, 'format': {'duration': duration}})
+    real = _sub.run
+    _sub.run = lambda *a, **k: types.SimpleNamespace(stdout=payload)
+    try:
+        chopper_probe_cache = __import__('chopper')._probe_cache
+        chopper_probe_cache.clear()
+        return probe('ffprobe', f'fake{len(payload)}{duration}.mp4')
+    finally:
+        _sub.run = real
+
+
+import types
+# honest constant-rate NTSC: used as-is, not flagged
+i = _fake_probe([{'codec_type': 'video', 'width': 1920, 'height': 1080,
+                  'r_frame_rate': '30000/1001', 'avg_frame_rate': '30000/1001',
+                  'nb_frames': '107892'}])
+assert not i['vfr'] and abs(i['fps'] - 30000 / 1001) < 1e-6, i
+
+# nominal rate lies (concatenated game film): trust the average, flag it
+j = _fake_probe([{'codec_type': 'video', 'width': 1920, 'height': 1080,
+                  'r_frame_rate': '30/1', 'avg_frame_rate': '45/2', 'nb_frames': '81000'}])
+assert j['vfr'] and abs(j['fps'] - 22.5) < 1e-6, j
+
+# avg_frame_rate missing/zero -> fall back to frames/duration, then to nominal
+k = _fake_probe([{'codec_type': 'video', 'width': 1920, 'height': 1080,
+                  'r_frame_rate': '30/1', 'avg_frame_rate': '0/0', 'nb_frames': '90000'}])
+assert abs(k['fps'] - 25.0) < 1e-6, k        # 90000 frames / 3600 s
+m = _fake_probe([{'codec_type': 'video', 'width': 1920, 'height': 1080,
+                  'r_frame_rate': '25/1', 'avg_frame_rate': '0/0'}])
+assert abs(m['fps'] - 25.0) < 1e-6 and not m['vfr'], m
+
+# cover art must not decide the sequence rate
+n = _fake_probe([{'codec_type': 'video', 'width': 100, 'height': 100,
+                  'r_frame_rate': '90000/1', 'avg_frame_rate': '90000/1',
+                  'disposition': {'attached_pic': 1}},
+                 {'codec_type': 'video', 'width': 1920, 'height': 1080,
+                  'r_frame_rate': '30000/1001', 'avg_frame_rate': '30000/1001'},
+                 {'codec_type': 'audio'}])
+assert n['width'] == 1920 and abs(n['fps'] - 30000 / 1001) < 1e-6 and n['has_audio'], n
+
 # --- label overlays ----------------------------------------------------------
 from PIL import Image
 with tempfile.TemporaryDirectory() as td:
