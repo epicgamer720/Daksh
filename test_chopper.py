@@ -91,6 +91,89 @@ with tempfile.TemporaryDirectory() as td:
     vids = list_videos(td)
     assert [v.name for v in vids] == ['vs calvary.mp4'], vids
 
+# nested tournament folders: the folder names take part in matching, and several
+# root folders can be searched at once (deduped when they overlap)
+with tempfile.TemporaryDirectory() as td:
+    root_a = Path(td) / 'Next level summer'
+    (root_a / 'Alliance' / '2027').mkdir(parents=True)
+    (root_a / 'Alliance' / '2027' / 'vs calvary.mp4').touch()
+    (root_a / 'Rumble' / '2027').mkdir(parents=True)
+    (root_a / 'Rumble' / '2027' / 'vs calvary.mp4').touch()
+    root_b = Path(td) / 'Spring tapes'
+    root_b.mkdir()
+    (root_b / 'vs Landon.mp4').touch()
+
+    assert len(list_videos(root_a)) == 2                    # recurses into tournaments
+    assert len(list_videos([root_a, root_b])) == 3          # several roots
+    assert len(list_videos([root_a, root_a / 'Alliance'])) == 2  # overlap deduped
+
+    # identical filenames in two tournaments -> the folder name decides
+    r_all = Row(sheet_row=2, game='Alliance vs Calvary', start=1.0, end=2.0)
+    r_rum = Row(sheet_row=3, game='Rumble vs Calvary', start=1.0, end=2.0)
+    match_videos([r_all, r_rum], [root_a, root_b])
+    assert r_all.src and r_all.src.parent.parent.name == 'Alliance', r_all.src
+    assert r_rum.src and r_rum.src.parent.parent.name == 'Rumble', r_rum.src
+    # a game found only in the second root still matches
+    r_lan = Row(sheet_row=4, game='Landon', start=1.0, end=2.0)
+    match_videos([r_lan], [root_a, root_b])
+    assert r_lan.src and r_lan.src.name == 'vs Landon.mp4', r_lan.src
+
+    # naming a tournament pins the match to that folder even when only one root is given
+    r_only = Row(sheet_row=8, game='Rumble vs Calvary', start=1.0, end=2.0)
+    match_videos([r_only], root_a)
+    assert r_only.src and r_only.src.parent.parent.name == 'Rumble', r_only.src
+    # a game naming no known folder is unaffected by the folder rule
+    r_plain = Row(sheet_row=9, game='Calvary', start=1.0, end=2.0)
+    match_videos([r_plain], [root_a, root_b])
+    assert r_plain.src and r_plain.src.name == 'vs calvary.mp4', r_plain.src
+    # digit identity still holds across folders: year folder is not a game number
+    r_two = Row(sheet_row=5, game='Alliance #2', start=1.0, end=2.0)
+    match_videos([r_two], [root_a, root_b])
+    assert r_two.src is None, r_two.src
+
+    # a tape NOT filed under its tournament folder must still win over a same-named
+    # file that is (folder evidence must never hard-filter the right answer away)
+    (root_a / 'Rumble vs Landon.mp4').touch()
+    r_loose = Row(sheet_row=10, game='Rumble vs Landon', start=1.0, end=2.0)
+    match_videos([r_loose], root_a)
+    assert r_loose.src and r_loose.src.name == 'Rumble vs Landon.mp4', r_loose.src
+    assert not r_loose.flags, r_loose.flags
+    (root_a / 'Rumble vs Landon.mp4').unlink()
+
+    # adding a subfolder BEFORE its parent must not strip that folder's name
+    for order in ([root_a / 'Rumble', root_a], [root_a, root_a / 'Rumble']):
+        r_ord = Row(sheet_row=11, game='Rumble vs Calvary', start=1.0, end=2.0)
+        match_videos([r_ord], order)
+        assert r_ord.src and r_ord.src.parent.parent.name == 'Rumble', (order, r_ord.src)
+
+    # a numbered folder that isn't the game ("Day 2") can't satisfy a game number
+    day = Path(td) / 'Summer'
+    (day / 'Day 2').mkdir(parents=True)
+    (day / 'Day 2' / 'Georgetown Prep 1.mp4').touch()
+    r_gp2 = Row(sheet_row=12, game='Georgetown Prep #2', start=1.0, end=2.0)
+    match_videos([r_gp2], day)
+    assert r_gp2.src is None, r_gp2.src
+    # ...but a folder that names the game carries its number just fine
+    (day / 'Georgetown Prep 2' / '2026').mkdir(parents=True)
+    (day / 'Georgetown Prep 2' / '2026' / 'full game.mp4').touch()
+    r_gp2b = Row(sheet_row=13, game='Georgetown Prep #2', start=1.0, end=2.0)
+    match_videos([r_gp2b], day)
+    assert r_gp2b.src and r_gp2b.src.parent.parent.name == 'Georgetown Prep 2', r_gp2b.src
+    # and an unrelated numbered folder doesn't hide a correctly-named flat file
+    (day / 'Georgetown Prep 3.mp4').touch()
+    r_gp3 = Row(sheet_row=14, game='Georgetown Prep #3', start=1.0, end=2.0)
+    match_videos([r_gp3], day)
+    assert r_gp3.src and r_gp3.src.name == 'Georgetown Prep 3.mp4', r_gp3.src
+
+    # a pre-scanned file list is reused as-is, and `exclude` still applies to it
+    scanned = list_videos([root_a, root_b])
+    r_pre = Row(sheet_row=6, game='Alliance vs Calvary', start=1.0, end=2.0)
+    match_videos([r_pre], [root_a, root_b], videos=scanned)
+    assert r_pre.src and r_pre.src.parent.parent.name == 'Alliance'
+    r_ex = Row(sheet_row=7, game='Alliance vs Calvary', start=1.0, end=2.0)
+    match_videos([r_ex], [root_a, root_b], videos=scanned, exclude=root_a / 'Alliance' / '2027')
+    assert r_ex.src != root_a / 'Alliance' / '2027' / 'vs calvary.mp4', r_ex.src
+
 # digit guard: "Game 2" must not match "Game 1.mp4" when Game 2's video is missing
 with tempfile.TemporaryDirectory() as td:
     (Path(td) / 'Game 1.mp4').touch()

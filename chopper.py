@@ -262,13 +262,54 @@ def norm_tokens(name):
     return re.sub(r'[^a-z0-9]+', ' ', name).split()
 
 
-def list_videos(folder, exclude=None):
-    folder = Path(folder)
-    return sorted(p for p in folder.rglob('*')
-                  if p.suffix.lower() in VIDEO_EXTS and p.is_file()
-                  # skip hidden files/dirs — esp. macOS "._*" AppleDouble junk on USB drives
-                  and not any(part.startswith('.') for part in p.relative_to(folder).parts)
-                  and not (exclude and exclude in p.parents))
+def as_folders(folders):
+    """Accept one folder or several; always return a list of Paths."""
+    if isinstance(folders, (str, Path)):
+        return [Path(folders)]
+    return [Path(f) for f in folders]
+
+
+def list_videos(folders, exclude=None):
+    """Every video under the chosen folder(s), recursively. Deduped if they overlap."""
+    found = set()
+    for folder in as_folders(folders):
+        for p in folder.rglob('*'):
+            if (p.suffix.lower() in VIDEO_EXTS and p.is_file()
+                    # skip hidden files/dirs — esp. macOS "._*" AppleDouble junk on USB drives
+                    and not any(part.startswith('.') for part in p.relative_to(folder).parts)
+                    and not (exclude and exclude in p.parents)):
+                found.add(p)
+    return sorted(found)
+
+
+def rel_to_root(path, roots):
+    """This file's path relative to the SHALLOWEST chosen folder that contains it.
+
+    Shallowest, not first-added: adding "Big/Rumble" and later "Big" must not strip the
+    "Rumble" folder from that subtree, or a game named after it loses its identity.
+    """
+    for root in sorted(roots, key=lambda r: len(r.parts)):
+        try:
+            return path.relative_to(root)
+        except ValueError:
+            continue
+    return Path(path.name)
+
+
+def digits_fit(game_toks, digits, stem_toks, comp_toks):
+    """Does this file carry the game's number as identity, not as coincidence?
+
+    A number counts if it is in the filename, or in a folder that also names the game:
+    "Georgetown Prep 2/2026/game.mp4" is Prep #2, but "Day 2/Georgetown Prep 1.mp4" is not.
+    """
+    if not digits:
+        return True
+    words = {t for t in game_toks if not t.isdigit()}
+    carriers = set(stem_toks)
+    for toks in comp_toks:
+        if toks & words:
+            carriers |= toks
+    return digits <= carriers
 
 
 def match_score(game, filename):
@@ -280,9 +321,23 @@ def match_score(game, filename):
     return 0.6 * overlap + 0.4 * ratio
 
 
-def match_videos(rows, folder, threshold=0.55, exclude=None):
-    """Fill row.src by fuzzy-matching game names to files. One match per game name."""
-    videos = list_videos(folder, exclude=exclude)
+def match_videos(rows, folders, threshold=0.55, exclude=None, videos=None):
+    """Fill row.src by fuzzy-matching game names to files. One match per game name.
+
+    Pass `videos` to reuse an existing scan — rglob over a big external drive is slow.
+    """
+    roots = as_folders(folders)
+    if videos is None:
+        videos = list_videos(roots, exclude=exclude)
+    elif exclude:
+        videos = [v for v in videos if exclude not in v.parents]
+    # Score against the filename and against folders+filename, whichever fits better:
+    # a name that matches on its own keeps its score, a name that only makes sense with
+    # its tournament folder still gets found.
+    rels = {v: rel_to_root(v, roots) for v in videos}
+    stem_toks = {v: set(norm_tokens(rels[v].stem)) for v in videos}
+    comp_toks = {v: [set(norm_tokens(p)) for p in rels[v].parts[:-1]] for v in videos}
+    labels = {v: ' '.join(rels[v].parts[:-1] + (rels[v].stem,)).strip() for v in videos}
     cache = {}
     for r in rows:
         if r.manual and r.src:
@@ -292,10 +347,20 @@ def match_videos(rows, folder, threshold=0.55, exclude=None):
             continue
         if r.game not in cache:
             # Digits are identity: "Prep #2" must never match "Prep 1.mp4" just because
-            # the words agree — require every digit token of the game in the filename.
-            digits = {t for t in norm_tokens(r.game) if t.isdigit()}
-            pool = [v for v in videos if digits <= set(norm_tokens(v.stem))]
-            scored = sorted(((match_score(r.game, v.stem), v) for v in pool),
+            # the words agree.
+            game_toks = norm_tokens(r.game)
+            digits = {t for t in game_toks if t.isdigit()}
+            pool = [v for v in videos
+                    if digits_fit(game_toks, digits, stem_toks[v], comp_toks[v])]
+            # Sitting in a folder the game names is evidence, never a filter: nudge those
+            # candidates up rather than dropping the rest, or a tape filed outside its
+            # tournament folder would vanish and a wrong one would win unflagged.
+            def score(v):
+                s = max(match_score(r.game, rels[v].stem), match_score(r.game, labels[v]))
+                named = {t for t in game_toks
+                         if any(t in toks for toks in comp_toks[v])}
+                return min(1.0, s + 0.1) if named else s
+            scored = sorted(((score(v), v) for v in pool),
                             reverse=True, key=lambda t: t[0])
             best = scored[0] if scored else (0.0, None)
             second = scored[1][0] if len(scored) > 1 else 0.0
@@ -561,6 +626,14 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
             kept.append(r)
             continue
         if r.start >= d:
+            if r.manual:
+                # Hand-picked a short pre-cut clip for a row whose times belong to the
+                # full game — the only sensible reading is "use this clip whole".
+                log(f'NOTE: "{r.label or r.game}" — using all of {r.src.name} '
+                    f'({fmt_tc(d)}); its times are past the end of this file')
+                r.whole_file = True
+                kept.append(r)
+                continue
             log(f'SKIPPED "{r.label or r.game}": starts at {fmt_tc(r.start)} but '
                 f'{r.src.name} is only {fmt_tc(d)} long — wrong video or wrong time?')
             continue
@@ -720,13 +793,14 @@ def run_gui():
 
     root.title('Clip Chopper')
     root.geometry('1100x640')
-    state = {'rows': [], 'sheet': None, 'videos': None}
+    state = {'rows': [], 'sheet': None, 'videos': [], 'video_files': []}
     log_q = queue.Queue()
 
     # --- top: spreadsheet + videos folder pickers -------------------------
     top = ttk.Frame(root, padding=8)
     top.pack(fill='x')
-    drop_text = 'Drop spreadsheet here (or Browse…)' if has_dnd else 'Choose spreadsheet (Browse…)'
+    drop_text = ('Drop spreadsheet or video folders here (or use the buttons)' if has_dnd
+                 else 'Choose spreadsheet (Browse…)')
     sheet_lbl = ttk.Label(top, text=drop_text, relief='groove', anchor='center', padding=10)
     sheet_lbl.grid(row=0, column=0, columnspan=2, sticky='ew', padx=(0, 6))
     ttk.Button(top, text='Browse…', command=lambda: pick_sheet()).grid(row=0, column=2)
@@ -735,16 +809,21 @@ def run_gui():
     url_entry = ttk.Entry(top, textvariable=url_var, width=60)
     url_entry.grid(row=1, column=1, sticky='ew', pady=(6, 0), padx=(0, 6))
     ttk.Button(top, text='Load URL', command=lambda: load_url()).grid(row=1, column=2, pady=(6, 0))
-    vid_lbl = ttk.Label(top, text='Videos folder: (not set)', anchor='w')
+    vid_lbl = ttk.Label(top, text='Video folders: (none yet — drop folders here or Add folder…)',
+                        anchor='w')
     vid_lbl.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
-    ttk.Button(top, text='Choose folder…', command=lambda: pick_videos()).grid(row=2, column=2, pady=(6, 0))
+    vid_btns = ttk.Frame(top)
+    vid_btns.grid(row=2, column=2, pady=(6, 0))
+    ttk.Button(vid_btns, text='Add folder…', command=lambda: pick_videos()).pack(side='left')
+    ttk.Button(vid_btns, text='Clear', width=6,
+               command=lambda: clear_videos()).pack(side='left', padx=(4, 0))
     top.columnconfigure(1, weight=1)
 
     # --- middle: review table --------------------------------------------
     mid = ttk.Frame(root, padding=(8, 0))
     mid.pack(fill='both', expand=True)
     cols = ('order', 'game', 'file', 'in', 'out', 'label', 'notes', 'status')
-    tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='browse')
+    tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='extended')
     widths = {'order': 45, 'game': 180, 'file': 180, 'in': 70, 'out': 70,
               'label': 170, 'notes': 180, 'status': 220}
     for c in cols:
@@ -755,6 +834,18 @@ def run_gui():
     tree.configure(yscrollcommand=ys.set)
     tree.pack(side='left', fill='both', expand=True)
     ys.pack(side='right', fill='y')
+
+    # --- manual assignment bar (select rows, give them a video) -----------
+    assign = ttk.Frame(root, padding=(8, 4))
+    assign.pack(fill='x')
+    ttk.Label(assign, text='Selected rows:').pack(side='left')
+    ttk.Button(assign, text='Assign video…',
+               command=lambda: assign_selected()).pack(side='left', padx=(6, 0))
+    ttk.Button(assign, text='Clear assignment',
+               command=lambda: unassign_selected()).pack(side='left', padx=(4, 0))
+    ttk.Label(assign, foreground='#666',
+              text='(shift/ctrl-click to pick several · right-click for the same menu · '
+                   'double-click any cell to edit it)').pack(side='left', padx=(10, 0))
 
     # --- bottom: options + generate + log ---------------------------------
     cfg = load_settings()
@@ -811,6 +902,7 @@ def run_gui():
         root.after(150, drain_log)
 
     def refresh_table():
+        keep = tree.selection()
         tree.delete(*tree.get_children())
         for i, r in enumerate(state['rows']):
             vals = (r.order if r.order is not None else '',
@@ -822,6 +914,9 @@ def run_gui():
                     '; '.join(r.flags) if r.flags else 'ok')
             tree.insert('', 'end', iid=str(i), values=vals,
                         tags=('bad',) if r.flags else ())
+        still = [i for i in keep if tree.exists(i)]
+        if still:
+            tree.selection_set(still)
         n_bad = sum(1 for r in state['rows'] if r.flags)
         if state['rows']:
             est = estimate_clip_bytes(state['rows']) / 1e6
@@ -839,7 +934,8 @@ def run_gui():
                 r.flags = [f for f in r.flags if 'match' not in f and 'video' not in f
                            and 'game name' not in f]
             exclude = state['sheet'].parent / 'clips' if state['sheet'] else None
-            match_videos(state['rows'], state['videos'], exclude=exclude)
+            match_videos(state['rows'], state['videos'], exclude=exclude,
+                         videos=state['video_files'])
         refresh_table()
 
     def load_sheet(path):
@@ -868,12 +964,77 @@ def run_gui():
         except Exception as e:
             messagebox.showerror('Google Sheets', str(e))
 
+    def add_videos(paths):
+        """Add one or more video folders (subfolders are always searched too)."""
+        added = [Path(p) for p in paths if Path(p).is_dir()]
+        new = [p for p in added if p not in state['videos']]
+        state['videos'] = state['videos'] + new
+        if not state['videos']:
+            state['video_files'] = []
+            vid_lbl.configure(text='Video folders: (none yet — drop folders here or Add folder…)')
+            refresh_table()
+            return
+        names = ', '.join(p.name or str(p) for p in state['videos'])
+        vid_lbl.configure(text=f'Video folders: {names}  (scanning…)')
+        root.update_idletasks()
+        state['video_files'] = list_videos(state['videos'])   # scanned once, reused by rematch
+        vid_lbl.configure(text=f'Video folders: {names}  ({len(state["video_files"])} videos found)')
+        rematch()
+
     def pick_videos():
-        p = filedialog.askdirectory(title='Folder containing the game videos')
+        p = filedialog.askdirectory(title='Folder with the game videos (subfolders included)')
         if p:
-            state['videos'] = Path(p)
-            vid_lbl.configure(text=f'Videos folder: {p}  ({len(list_videos(p))} videos found)')
-            rematch()
+            add_videos([p])
+
+    def clear_videos():
+        state['videos'] = []
+        add_videos([])
+
+    def assign_file(rows_to_set, title):
+        """Ask for a video and pin it to these rows — manual picks survive re-matching."""
+        if not rows_to_set:
+            log('Select a row in the table first, then Assign video…')
+            return
+        p = filedialog.askopenfilename(
+            title=title,
+            initialdir=state['videos'][0] if state['videos'] else '.',
+            filetypes=[('Videos', ' '.join(f'*{e}' for e in VIDEO_EXTS)), ('All files', '*.*')])
+        if not p:
+            return
+        for r in rows_to_set:
+            r.src = Path(p)
+            r.manual = True
+            r.flags = [f for f in r.flags if 'match' not in f and 'video' not in f
+                       and 'game name' not in f]
+        log(f'Assigned {Path(p).name} to {len(rows_to_set)} row(s)')
+        refresh_table()
+
+    def selected_rows():
+        return [state['rows'][int(i)] for i in tree.selection() if i.isdigit()]
+
+    def assign_selected():
+        rows_sel = selected_rows()
+        assign_file(rows_sel, f'Video for {len(rows_sel)} selected row(s)')
+
+    def unassign_selected():
+        rows_sel = selected_rows()
+        if not rows_sel:
+            log('Select a row in the table first, then Clear assignment')
+            return
+        for r in rows_sel:
+            r.src, r.manual = None, False
+        rematch()   # let auto-matching have another go at them
+        log(f'Cleared {len(rows_sel)} assignment(s)')
+
+    def on_right_click(event):
+        item = tree.identify_row(event.y)
+        if item and item not in tree.selection():
+            tree.selection_set(item)
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label='Assign video to selected row(s)…', command=assign_selected)
+        menu.add_command(label='Clear assignment', command=unassign_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
 
     def on_double_click(event):
         item, col = tree.identify_row(event.y), tree.identify_column(event.x)
@@ -882,18 +1043,16 @@ def run_gui():
         r = state['rows'][int(item)]
         col_name = cols[int(col[1:]) - 1]
         if col_name == 'file':
-            p = filedialog.askopenfilename(
-                title=f'Video for "{r.game}"',
-                initialdir=state['videos'] or '.',
-                filetypes=[('Videos', ' '.join(f'*{e}' for e in VIDEO_EXTS)), ('All files', '*.*')])
-            if p:
-                # same game -> same file everywhere; blank game names stay individual
-                targets = [o for o in state['rows'] if o.game == r.game] if r.game else [r]
-                for other in targets:
-                    other.src = Path(p)
-                    other.manual = True
-                    other.flags = [f for f in other.flags if 'match' not in f and 'video' not in f]
-                refresh_table()
+            # one row's file usually means the whole game's file, unless several rows
+            # are deliberately selected or the game name is blank
+            sel = selected_rows()
+            if len(sel) > 1 and r in sel:
+                targets = sel
+            elif r.game:
+                targets = [o for o in state['rows'] if o.game == r.game]
+            else:
+                targets = [r]
+            assign_file(targets, f'Video for "{r.game}"' if r.game else 'Video for this clip')
         elif col_name in ('in', 'out', 'label', 'notes'):
             edit_cell(item, col, r, col_name)
 
@@ -984,17 +1143,24 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start()
 
     tree.bind('<Double-1>', on_double_click)
+    tree.bind('<Button-3>', on_right_click)     # Windows/Linux right-click
+    tree.bind('<Button-2>', on_right_click)     # macOS right-click / two-finger tap
     if has_dnd:
         def on_drop(event):
-            paths = root.tk.splitlist(event.data)
-            if paths:
-                load_sheet(paths[0])
+            paths = [Path(p) for p in root.tk.splitlist(event.data)]
+            folders = [p for p in paths if p.is_dir()]
+            sheets = [p for p in paths if p.is_file()]
+            if folders:
+                add_videos(folders)
+            if sheets:
+                load_sheet(sheets[0])
         for w in (root, sheet_lbl):
             w.drop_target_register(DND_FILES)
             w.dnd_bind('<<Drop>>', on_drop)
 
     drain_log()
-    log('1) Load your spreadsheet   2) Choose the videos folder   3) Review the table   4) Generate')
+    log('1) Load your spreadsheet   2) Add your video folder(s) — subfolders are searched too'
+        '   3) Review the table   4) Generate')
     root.mainloop()
 
 

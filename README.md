@@ -15,8 +15,14 @@ Requires Python 3 from [python.org](https://python.org).
 ## Use it
 
 1. Drop your spreadsheet (.xlsx/.csv) onto the window — or paste a Google Sheets link.
-2. Pick the folder that holds the game videos (filenames should mention the opponent).
-3. Review the table. Red rows need attention — double-click a cell to fix a time or pick a file.
+2. Drop in the folder(s) holding your game videos (or use **Add folder…**). Subfolders are always
+   searched, and folder names help identify games — so one big folder of tournament subfolders
+   works, and a row for "Alliance vs Calvary" finds `Alliance/2027/vs calvary.mp4`. Add as many
+   separate folders as you like; **Clear** starts over.
+3. Review the table. Red rows need attention. To assign a video by hand, select the row(s) —
+   shift/ctrl-click for several — and hit **Assign video…** (or right-click). Hand-picked files
+   are never overwritten by auto-matching; **Clear assignment** hands a row back to it.
+   Double-click any In/Out/Label/Notes cell to edit it.
 4. Optional: turn on **Add clip labels as text in the timeline** and pick your font file + size.
 5. **Generate** → import the `..._timeline.xml` into Premiere (File > Import). Clips appear in
    order; labels sit on a second video track and stay editable. Keep the `labels/` folder —
