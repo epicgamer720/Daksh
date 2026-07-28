@@ -8,8 +8,8 @@ from xml.etree import ElementTree as ET
 
 sys.stdout.reconfigure(encoding='utf-8')
 from chopper import (Row, build_xmeml, find_columns, list_videos, match_score,
-                     match_videos, norm_tokens, parse_range, parse_sheet, parse_tc,
-                     render_label_png, sanitize_filename)
+                     match_videos, norm_tokens, opponent_tokens, parse_range,
+                     parse_sheet, parse_tc, render_label_png, sanitize_filename)
 
 HERE = Path(__file__).parent
 
@@ -30,6 +30,18 @@ s2 = match_score('Georgetown Prep #2 (Daksh)', 'Georgetown Prep 2')
 s1 = match_score('Georgetown Prep #2 (Daksh)', 'Georgetown Prep 1')
 assert s2 > s1 > 0, (s1, s2)
 assert match_score('Bullis #1 (Daksh)', 'vs Bullis Game 1 Spring') > 0.55
+
+# Game film is "<us> vs <them>" and the sheet names <them>, so our own team is noise
+# that every file in the library repeats — and noise that scores.
+assert opponent_tokens(norm_tokens('29s 3D NE Red vs 91 georgia')) == ['91', 'georgia']
+assert opponent_tokens(norm_tokens('vs stealth')) == ['stealth']
+assert opponent_tokens(norm_tokens('sweetlax upstate')) == ['sweetlax', 'upstate']  # no "vs"
+assert opponent_tokens(norm_tokens('3d 29 vs')) == ['3d', '29', 'vs']  # nothing after it
+# "3D Georgia" took BOTH its words off a tape of a different club — "3d" from our own
+# name, "georgia" from "91 georgia" — and beat its own game by 0.006.
+right = match_score('3D Georgia', '3d NE Red 2029 vs 3d Georgia')
+wrong = match_score('3D Georgia', '29s 3D NE Red vs 91 georgia')
+assert right - wrong > 0.1, (right, wrong)
 
 # --- header detection on a differently-formatted sheet ----------------------
 alt = [
@@ -174,6 +186,49 @@ with tempfile.TemporaryDirectory() as td:
     match_videos([r_ex], [root_a, root_b], videos=scanned, exclude=root_a / 'Alliance' / '2027')
     assert r_ex.src != root_a / 'Alliance' / '2027' / 'vs calvary.mp4', r_ex.src
 
+# the summer '29 library: our own team's name is in every file, so the sheet's words can
+# all land on a tape of a different club (real misses, "Final summer highlight" sheet)
+with tempfile.TemporaryDirectory() as td:
+    summer = Path(td) / "3D '29 summer"
+    for folder, names in {
+        'LI showdown': ['29s 3D NE Red vs 91 georgia', '29s 3D NE vs Hilltop',
+                        '29s 3D NE Red vs leading edge', '29s 3D NE Maddog'],
+        'Sweetlax': ['3d NE Red 2029 vs 3d Georgia', '3d NE Red 2029 vs Sweetlax Upstate',
+                     '3d NE Red 2029 vs NJ Riot', '3d NE Red 2029 vs 2Way'],
+        'Great 8': ['3d 29 vs 91 Colorado Great 8', '3d 29 vs Shore2Shore Great 8',
+                    '3d 29 vs Tri-State Great 8', '3d 29 vs Mad Dog West Great 8'],
+        'NAL': ['sweetlax upstate', 'vs resolute ohio'],
+        'Alliance': ['vs 2way', 'vs maddog east', 'vs Sweetlax'],
+    }.items():
+        (summer / folder).mkdir(parents=True)
+        for n in names:
+            (summer / folder / f'{n}.mp4').touch()
+
+    # "3D Georgia" must not take "91 georgia": both words fit that file — "3d" off OUR
+    # name, "georgia" off a different club — and it used to win by 0.006.
+    want = {'3D Georgia': ('Sweetlax', '3d NE Red 2029 vs 3d Georgia.mp4'),
+            '91 Colorado': ('Great 8', '3d 29 vs 91 Colorado Great 8.mp4'),
+            'Shore2Shore': ('Great 8', '3d 29 vs Shore2Shore Great 8.mp4'),
+            'Tri-State': ('Great 8', '3d 29 vs Tri-State Great 8.mp4'),
+            'NJ riot': ('Sweetlax', '3d NE Red 2029 vs NJ Riot.mp4'),
+            'Maddog East': ('Alliance', 'vs maddog east.mp4'),
+            'Leading Edge': ('LI showdown', '29s 3D NE Red vs leading edge.mp4'),
+            'Hilltop': ('LI showdown', '29s 3D NE vs Hilltop.mp4'),
+            'Resolute Ohio': ('NAL', 'vs resolute ohio.mp4')}
+    for game, (folder, fname) in want.items():
+        r = Row(sheet_row=2, game=game, start=1.0, end=2.0)
+        match_videos([r], summer)
+        assert r.src and (r.src.parent.name, r.src.name) == (folder, fname), (game, r.src)
+        assert not r.flags, (game, r.flags)
+
+    # two real games against one opponent can't be told apart by name: pick one, but say
+    # so — never silently. ("sweetlax upstate" at NAL vs the Sweetlax tournament tape.)
+    for game in ('Sweetlax Upstate', '2way'):
+        r = Row(sheet_row=3, game=game, start=1.0, end=2.0)
+        match_videos([r], summer)
+        assert r.src, game
+        assert any('ambiguous' in f for f in r.flags), (game, r.flags)
+
 # digit guard: "Game 2" must not match "Game 1.mp4" when Game 2's video is missing
 with tempfile.TemporaryDirectory() as td:
     (Path(td) / 'Game 1.mp4').touch()
@@ -228,7 +283,7 @@ assert root.tag == 'xmeml'
 vitems = root.findall('.//video/track/clipitem')
 aitems = root.findall('.//audio/track/clipitem')
 assert len(vitems) == 2 and len(aitems) == 2
-# clip 1: in/out at file fps (29.97), 10s-15s
+# clip 1: in/out at the sequence rate (here also 29.97), 10s-15s
 assert vitems[0].find('in').text == str(round(10.0 * 29.97))
 assert vitems[0].find('out').text == str(round(15.0 * 29.97))
 assert vitems[0].find('start').text == '0'
@@ -246,6 +301,41 @@ assert 'file://localhost/' in full_defs[0].find('pathurl').text
 # marker carries the note
 marker = root.find('sequence/marker')
 assert marker is not None and marker.find('comment').text == 'speed up'
+
+# --- mixed frame rates on one timeline ---------------------------------------
+# Premiere reads every frame number on a clipitem at the SEQUENCE rate, whatever <rate>
+# the clipitem carries. Counting in/out in source frames sent 29.97 film to half its
+# timecode and 119.88 to double, and pushed a late clip in a fast file past the end of
+# its media, where it imported as nothing at all. Only footage matching the sequence
+# came in right, which is what made it look like a handful of bad rows.
+slow, fast, base = HERE / 'slow.mp4', HERE / 'fast.mp4', HERE / 'base.mp4'
+mixed_probes = {
+    str(base): {'fps': 60 / 1.001, 'width': 1920, 'height': 1080,
+                'duration': 3600.0, 'has_audio': True},
+    str(slow): {'fps': 30 / 1.001, 'width': 1920, 'height': 1080,
+                'duration': 3600.0, 'has_audio': True},
+    str(fast): {'fps': 120 / 1.001, 'width': 2784, 'height': 1566,
+                'duration': 2237.2, 'has_audio': True},
+}
+mixed_rows = [  # two 59.94 rows make it the sequence rate, as the real library does
+    Row(sheet_row=2, game='Futures', start=1826.0, end=1840.0, order=1, src=base),
+    Row(sheet_row=3, game='Hilltop', start=705.0, end=715.0, order=2, src=base),
+    Row(sheet_row=4, game='3D Georgia', start=869.0, end=878.0, order=3, src=slow),
+    Row(sheet_row=5, game='Sweetlax Upstate', start=1753.0, end=1766.0, order=4, src=fast),
+]
+mroot = ET.fromstring(build_xmeml(mixed_rows, mixed_probes, 'Mixed'))
+mseq = int(mroot.find('sequence/rate/timebase').text) / 1.001
+assert round(mseq, 2) == round(60 / 1.001, 2), mseq
+for item, row in zip(mroot.findall('.//video/track/clipitem'), mixed_rows):
+    landed = int(item.find('in').text) / mseq
+    assert abs(landed - row.start) < 0.05, (row.game, landed, row.start)
+    # and it must still point inside the media, or Premiere imports no clip at all
+    assert landed < mixed_probes[str(row.src)]['duration'], (row.game, landed)
+    assert item.find('rate/timebase').text == mroot.find('sequence/rate/timebase').text
+# the <file> keeps its own rate — that is how Premiere conforms the media
+fast_def = [f for f in mroot.findall('.//file')
+            if f.find('name') is not None and f.find('name').text == 'fast.mp4'][0]
+assert fast_def.find('rate/timebase').text == '120', ET.tostring(fast_def.find('rate'))
 
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 

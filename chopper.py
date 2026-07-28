@@ -312,13 +312,34 @@ def digits_fit(game_toks, digits, stem_toks, comp_toks):
     return digits <= carriers
 
 
+def opponent_tokens(toks):
+    """The part of a file name after "vs" — game film is named "<us> vs <them>".
+
+    The sheet names the opponent, so our own team is noise that every file repeats.
+    Worse, it is noise that scores: "3D Georgia" took all of its words from
+    "29s 3D NE Red vs 91 georgia" — "3d" off OUR name, "georgia" off a different
+    club — and beat its own tape by six thousandths.
+    """
+    for i in range(len(toks) - 1, -1, -1):
+        if toks[i] in ('vs', 'v'):
+            return toks[i + 1:] or toks
+    return toks
+
+
+def _overlap_score(g, f):
+    overlap = len(set(g) & set(f)) / len(g)
+    ratio = difflib.SequenceMatcher(None, ' '.join(g), ' '.join(f)).ratio()
+    return 0.6 * overlap + 0.4 * ratio
+
+
 def match_score(game, filename):
     g, f = norm_tokens(game), norm_tokens(filename)
     if not g or not f:
         return 0.0
-    overlap = len(set(g) & set(f)) / len(g)
-    ratio = difflib.SequenceMatcher(None, ' '.join(g), ' '.join(f)).ratio()
-    return 0.6 * overlap + 0.4 * ratio
+    # Score the whole name and the opponent alone, best wins: a file that names only
+    # the opponent keeps its score, and one that buries the opponent behind our own
+    # team is judged on the half that actually identifies the game.
+    return max(_overlap_score(g, f), _overlap_score(g, opponent_tokens(f)))
 
 
 def match_videos(rows, folders, threshold=0.55, exclude=None, videos=None):
@@ -536,9 +557,16 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
     for n, r in enumerate(rows, 1):
         p = probes[str(r.src)]
         start, end = (0.0, p['duration']) if r.whole_file else (r.start, r.end)
-        f_in, f_out = round(start * p['fps']), round(end * p['fps'])
+        # Every frame number ON THE CLIPITEM is read at the SEQUENCE rate, never at the
+        # source's own rate, whatever <rate> the clipitem carries. Counting in/out in
+        # source frames put every clip whose footage differs from the sequence at the
+        # wrong time — 29.97 film landed at half its timecode, 119.88 at double, and a
+        # late clip in a fast file pointed past the end of the media and imported as
+        # nothing at all. Only footage that happened to match the sequence came in right.
+        f_in, f_out = round(start * seq_fps), round(end * seq_fps)
         dur = round((end - start) * seq_fps)
-        file_frames = round(p['duration'] * p['fps'])
+        clip_frames = round(p['duration'] * seq_fps)
+        file_frames = round(p['duration'] * p['fps'])   # <file> stays in its own rate
         name = escape(f'{n:02d} - {r.label or r.game}')
         path = str(r.src)
 
@@ -564,8 +592,8 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
                     f'<trackindex>1</trackindex><clipindex>{n}</clipindex></link>')
 
         vid, aid = f'clipitem-v{n}', f'clipitem-a{n}'
-        common = (f'<enabled>TRUE</enabled><duration>{file_frames}</duration>'
-                  f'{_rate_xml(p["fps"])}<start>{t}</start><end>{t + dur}</end>'
+        common = (f'<enabled>TRUE</enabled><duration>{clip_frames}</duration>'
+                  f'{_rate_xml(seq_fps)}<start>{t}</start><end>{t + dur}</end>'
                   f'<in>{f_in}</in><out>{f_out}</out>')
         link_xml = links(vid, aid) if p['has_audio'] else ''
         v_items.append(f'<clipitem id="{vid}"><name>{name}</name>{common}{file_xml}'
