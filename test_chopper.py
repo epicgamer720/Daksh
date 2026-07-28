@@ -452,6 +452,49 @@ try:
 finally:
     _ch.probe, _ch.find_ffmpeg = _orig_probe, _orig_ff
 
+# --- watchable preview video (needs ffmpeg; skipped if unavailable) -----------
+# The preview must BE the timeline: clips in order, black for exactly each gap's
+# length, one uniform stream no matter how the sources differ.
+_ff = None
+try:
+    _ff = _ch.find_ffmpeg()
+except Exception:
+    print('NOTE: ffmpeg unavailable — preview-video render test skipped')
+if _ff:
+    import json as _pjson
+    import subprocess as _psub
+    ffmpeg_bin, ffprobe_bin = _ff
+    with tempfile.TemporaryDirectory() as td:
+        srcs = {}
+        for name, audio in (('loud.mp4', True), ('mute.mp4', False)):
+            p = Path(td) / name
+            cmd = [ffmpeg_bin, '-y', '-hide_banner', '-loglevel', 'error',
+                   '-f', 'lavfi', '-i', 'testsrc=size=320x180:rate=25:duration=3']
+            if audio:
+                cmd += ['-f', 'lavfi', '-t', '3', '-i', 'sine=frequency=440',
+                        '-c:a', 'aac', '-shortest']
+            cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(p)]
+            _psub.run(cmd, capture_output=True, check=True)
+            srcs[name] = p
+        w_rows = [Row(sheet_row=2, game='A', start=0.5, end=1.5, src=srcs['loud.mp4']),
+                  Row(sheet_row=3, game='B', start=0.0, end=2.0, src=srcs['loud.mp4'],
+                      enabled=False),                       # -> 2s of black
+                  Row(sheet_row=4, game='C', start=1.0, end=2.0, src=srcs['mute.mp4'])]
+        w_probes = {str(p): _ch.probe(ffprobe_bin, p) for p in srcs.values()}
+        w_segs = timeline_layout(w_rows, w_probes)
+        out = _ch.render_preview_video(w_segs, w_probes, ffmpeg_bin)
+        fmt = _pjson.loads(_psub.run(
+            [ffprobe_bin, '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'json', str(out)], capture_output=True, text=True).stdout)
+        got = float(fmt['format']['duration'])
+        assert abs(got - 4.0) < 0.35, got     # 1 + 2 (gap) + 1, small container slack
+        # mixed audio/no-audio sources still concat into one playable stream
+        streams = _pjson.loads(_psub.run(
+            [ffprobe_bin, '-v', 'error', '-show_entries', 'stream=codec_type',
+             '-of', 'json', str(out)], capture_output=True, text=True).stdout)
+        kinds = sorted(s['codec_type'] for s in streams['streams'])
+        assert kinds == ['audio', 'video'], kinds
+
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 
 # --- usage ping --------------------------------------------------------------

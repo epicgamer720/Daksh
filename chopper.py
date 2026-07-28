@@ -589,6 +589,96 @@ def grab_frame(ffmpeg, src, sec, out_path, width=None):
                    capture_output=True, text=True, check=True)
 
 
+# ------------------------------------------------------------ preview video
+
+PREVIEW_SIZE = (960, 540)   # low-res mezzanine: fast to encode, plenty to judge a cut
+PREVIEW_FPS = 30
+_watch_dir = None
+_watch_parts = {}           # segment key -> encoded part path (cached per session)
+
+
+def watch_dir():
+    global _watch_dir
+    if _watch_dir is None or not _watch_dir.exists():
+        _watch_dir = Path(tempfile.mkdtemp(prefix='chop_watch_'))
+    return _watch_dir
+
+
+def encode_preview_part(ffmpeg, seg, probes):
+    """One timeline segment as a uniform 960x540/30fps mp4; cached for the session.
+
+    Every part lands on the same size/rate/codecs no matter what the source looks
+    like — that is what lets the full-timeline preview concat them with stream copy
+    instead of re-encoding everything again. Gaps become black (with silence) for
+    exactly their duration, so what you watch is what Premiere will import.
+    """
+    r, dur = seg['row'], seg['dur']
+    w, h = PREVIEW_SIZE
+    if seg['kind'] == 'gap':
+        key = ('gap', round(dur, 3))
+    else:
+        key = (str(r.src), round(seg['start'], 3), round(seg['end'], 3))
+    part = _watch_parts.get(key)
+    if part and part.exists():
+        return part
+    part = watch_dir() / f'part_{hashlib.sha256(repr(key).encode()).hexdigest()[:12]}.mp4'
+    common = ['-t', f'{dur:.3f}', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+              '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
+              '-ac', '2', '-ar', '48000', '-movflags', '+faststart', str(part)]
+    if seg['kind'] == 'gap':
+        cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+               '-f', 'lavfi', '-i', f'color=black:s={w}x{h}:r={PREVIEW_FPS}:d={dur:.3f}',
+               '-f', 'lavfi', '-t', f'{dur:.3f}', '-i', 'anullsrc=r=48000:cl=stereo',
+               '-shortest', *common]
+    else:
+        has_audio = probes[str(r.src)]['has_audio']
+        vf = (f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
+              f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={PREVIEW_FPS}')
+        cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+               '-ss', f'{seg["start"]:.3f}', '-i', str(r.src)]
+        if not has_audio:
+            cmd += ['-f', 'lavfi', '-t', f'{dur:.3f}', '-i', 'anullsrc=r=48000:cl=stereo']
+        cmd += ['-vf', vf, '-map', '0:v:0', '-map', f'{"0" if has_audio else "1"}:a:0',
+                '-shortest', *common]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    _watch_parts[key] = part
+    return part
+
+
+def render_preview_video(segs, probes, ffmpeg, log=lambda m: None):
+    """Concat every placed segment into one watchable low-res file; returns its path."""
+    segs = [s for s in segs if s['dur'] is not None]
+    if not segs:
+        raise ValueError('Nothing to watch — no placeable rows')
+    total = sum(s['dur'] for s in segs)
+    log(f'Rendering {fmt_tc(total)} preview at {PREVIEW_SIZE[1]}p...')
+    parts = []
+    for i, seg in enumerate(segs, 1):
+        r = seg['row']
+        what = 'gap' if seg['kind'] == 'gap' else (r.label or r.game or r.src.name)
+        slow = ' — whole game, this one takes a while' if seg['dur'] > 120 else ''
+        log(f'[preview {i}/{len(segs)}] {what} ({fmt_tc(seg["dur"])}){slow}')
+        parts.append(encode_preview_part(ffmpeg, seg, probes))
+    lst = watch_dir() / 'concat.txt'
+    lst.write_text(''.join(f"file '{p}'\n" for p in parts), encoding='utf-8')
+    out = watch_dir() / 'timeline_preview.mp4'
+    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'concat', '-safe', '0', '-i', str(lst),
+                    '-c', 'copy', '-movflags', '+faststart', str(out)],
+                   capture_output=True, text=True, check=True)
+    return out
+
+
+def open_media(path):
+    """Open a file in the OS default video player."""
+    if sys.platform == 'darwin':
+        subprocess.Popen(['open', str(path)])
+    elif os.name == 'nt':
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(['xdg-open', str(path)])
+
+
 # ------------------------------------------------------------ label graphics
 
 def render_label_png(text, font_path, size, width, height, out_path):
@@ -1265,6 +1355,8 @@ def run_gui():
         if item and item not in tree.selection():
             tree.selection_set(item)
         menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label='Watch this clip (low-res)',
+                         command=lambda: watch_rows(selected_rows()))
         menu.add_command(label='Toggle clip on/off (leaves a gap)',
                          command=lambda: toggle_rows(selected_rows()))
         menu.add_command(label='Assign video to selected row(s)…', command=assign_selected)
@@ -1389,6 +1481,61 @@ def run_gui():
 
         threading.Thread(target=work, daemon=True).start()
 
+    def cached_probes(rows):
+        return {str(r.src): _probe_cache[str(r.src)] for r in rows
+                if r.src and str(r.src) in _probe_cache}
+
+    watch_busy = {'on': False}
+
+    def watch_rows(target_rows=None):
+        """Render the actual footage at 540p and open it in the video player.
+
+        target_rows=None watches the WHOLE timeline — clips in order with black
+        where the gaps are; a list watches just those rows' clips.
+        """
+        if watch_busy['on']:
+            log('A preview render is already running — wait for it to finish')
+            return
+        watch_busy['on'] = True
+
+        def wk():
+            try:
+                ffmpeg, ffprobe = find_ffmpeg()
+                rows = state['rows'] if target_rows is None else target_rows
+                for r in rows:
+                    if r.src and str(r.src) not in _probe_cache:
+                        try:
+                            probe(ffprobe, r.src)
+                        except Exception:
+                            pass
+                if target_rows is not None:
+                    # watching specific rows: show their footage even if toggled off —
+                    # checking what's in a clip is exactly why you'd watch it
+                    rows = [copy.copy(r) for r in rows]
+                    for r in rows:
+                        r.enabled = True
+                segs = timeline_layout(rows, cached_probes(rows))
+                if target_rows is not None:     # single clips: footage only, no gaps
+                    segs = [s for s in segs if s['kind'] == 'clip']
+                segs = [s for s in segs if s['dur'] is not None]
+                if not segs:
+                    log('Nothing to watch — that row has no video or timecode')
+                    return
+                if len(segs) == 1 and segs[0]['kind'] == 'clip':
+                    s = segs[0]
+                    log(f'Cutting "{s["row"].label or s["row"].game}" at 540p...')
+                    out = encode_preview_part(ffmpeg, s, _probe_cache)
+                else:
+                    out = render_preview_video(segs, _probe_cache, ffmpeg, log)
+                open_media(out)
+                log('Preview opened in your video player')
+            except Exception as e:
+                log(f'Preview render failed: {e}')
+            finally:
+                watch_busy['on'] = False
+
+        threading.Thread(target=wk, daemon=True).start()
+
     def preview_timeline():
         """Draw the sequence as it will import — clips, gaps, thumbnails — no Premiere needed.
 
@@ -1401,8 +1548,12 @@ def run_gui():
         alive = {'ok': True, 'tdir': None}
         thumbs = {}                       # id(row) -> PhotoImage; ref MUST live on
         win._thumb_refs = thumbs          # or Tk garbage-collects the images off the canvas
-        info = ttk.Label(win, anchor='w', padding=(8, 4))
-        info.pack(side='bottom', fill='x')
+        bar = ttk.Frame(win)
+        bar.pack(side='bottom', fill='x')
+        ttk.Button(bar, text='▶ Watch video',
+                   command=lambda: watch_rows(None)).pack(side='right', padx=8, pady=4)
+        info = ttk.Label(bar, anchor='w', padding=(8, 4))
+        info.pack(side='left', fill='x', expand=True)
         xs = ttk.Scrollbar(win, orient='horizontal')
         canvas = tk.Canvas(win, height=200, background='#20242a', highlightthickness=0,
                            xscrollcommand=xs.set)
@@ -1410,17 +1561,13 @@ def run_gui():
         xs.pack(side='bottom', fill='x')
         canvas.pack(fill='both', expand=True)
 
-        def known_probes(rows):
-            return {str(r.src): _probe_cache[str(r.src)] for r in rows
-                    if r.src and str(r.src) in _probe_cache}
-
         def draw():
             if not alive['ok']:
                 return
             canvas.delete('all')
             rows = state['rows']          # read live: table edits and reloads show up
             rowpos = {id(r): i for i, r in enumerate(rows)}
-            segs = timeline_layout(rows, known_probes(rows))
+            segs = timeline_layout(rows, cached_probes(rows))
             dropped = sum(1 for r in rows if not place_kind(r))
             if not segs:
                 canvas.create_text(20, 40, anchor='w', fill='#ccc',
@@ -1470,6 +1617,9 @@ def run_gui():
                             tree.selection_set(str(p))
                             tree.see(str(p))
                     canvas.tag_bind(tag, '<Button-1>', pick)
+                if s['kind'] == 'clip':
+                    canvas.tag_bind(tag, '<Double-1>',
+                                    lambda _e, row=r: watch_rows([row]))
                 x += w
             canvas.configure(scrollregion=(0, 0, x + 16, 200))
             nclips = sum(1 for s in segs if s['kind'] == 'clip')
@@ -1477,7 +1627,7 @@ def run_gui():
                                 f'{len(segs) - nclips} gap(s)'
                            + (f' · {dropped} row(s) not placeable (no video or timecode)'
                               if dropped else '')
-                           + ' — click a block to select its row')
+                           + ' — click a block to select its row, double-click to watch it')
 
         def add_thumb(row_id, png):
             if not alive['ok']:
@@ -1512,7 +1662,7 @@ def run_gui():
             if not alive['ok']:           # closed while we were probing
                 shutil.rmtree(tdir, ignore_errors=True)
                 return
-            for i, s in enumerate(timeline_layout(rows, known_probes(rows))):
+            for i, s in enumerate(timeline_layout(rows, cached_probes(rows))):
                 if not alive['ok']:
                     return
                 if s['kind'] != 'clip':

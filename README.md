@@ -30,7 +30,11 @@ Requires Python 3 from [python.org](https://python.org).
    Check **+ team** to append the opponent from the sheet ("Goal" → "Goal vs Sweetlax").
    **Preview…** shows the label on a real frame from your footage — tune the size right there.
 5. **Preview timeline** shows the sequence — clips, gaps, thumbnails — before you ever open
-   Premiere. Click a block to select its row in the table.
+   Premiere. Click a block to select its row; double-click a block to **watch that clip**,
+   or hit **▶ Watch video** to watch the whole timeline as an actual video (clips in order,
+   black where the gaps are) in your video player. Right-clicking a table row offers
+   **Watch this clip** too. Previews render fast at 540p and are cached, so re-watching
+   is instant — your source files are never touched.
 6. **Generate** → import the `..._timeline.xml` into Premiere (File > Import). Clips appear in
    order; labels sit on a second video track and stay editable. Keep the `labels/` folder —
    the timeline references it.
