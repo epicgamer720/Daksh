@@ -66,8 +66,15 @@ class Row:
 
 
 def parse_tc(text):
-    """'14:18' -> 858.0, '1:00:10' -> 3610.0, else None."""
-    m = TC_RE.match(text.strip())
+    """'14:18' -> 858.0, '1:00:10' -> 3610.0, ':52' -> 52.0, else None.
+
+    Real sheets arrive with shift-slip typos: ';' for ':' and a dropped leading
+    zero (':52' meaning 0:52). Both read fine to a human, so they parse here.
+    """
+    text = text.strip().replace(';', ':')
+    if m := re.fullmatch(r':(\d{1,2})', text):
+        return int(m.group(1))
+    m = TC_RE.match(text)
     if not m:
         return None
     a, b, c = m.groups()
@@ -78,7 +85,7 @@ def parse_tc(text):
 
 def parse_range(text):
     """Return (start, end) seconds or None if text is not a timecode range."""
-    m = RANGE_RE.match(DASHES.sub('-', text))
+    m = RANGE_RE.match(DASHES.sub('-', text.replace(';', ':')))
     if not m:
         return None
     start, end = parse_tc(m.group(1)), parse_tc(m.group(2))
@@ -257,10 +264,19 @@ def parse_sheet(path):
 
 # ------------------------------------------------------------ video matching
 
+NUM_WORDS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+             'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+             'eleven': '11', 'twelve': '12'}
+
+
 def norm_tokens(name):
-    """'Georgetown Prep #2 (Daksh)' -> ['georgetown', 'prep', '2']."""
+    """'Georgetown Prep #2 (Daksh)' -> ['georgetown', 'prep', '2'].
+
+    Number words become digits so "Team 10" finds "vs team ten.mp4" — and its
+    "10" counts as carried identity for the digit rule.
+    """
     name = re.sub(r'\([^)]*\)', ' ', name.lower())
-    return re.sub(r'[^a-z0-9]+', ' ', name).split()
+    return [NUM_WORDS.get(t, t) for t in re.sub(r'[^a-z0-9]+', ' ', name).split()]
 
 
 def as_folders(folders):
@@ -416,22 +432,54 @@ def opponent_tokens(toks):
     return toks
 
 
+def _abbrev(token, run):
+    """Is `token` an initialism of this run of tokens? 'gs'~('garden','state'),
+    'btb'~('be','the','best'), and 'dce'~('dc','express') — the first word may
+    contribute itself, not just its first letter."""
+    return token in (''.join(w[0] for w in run),
+                     run[0] + ''.join(w[0] for w in run[1:]))
+
+
+def _covers(t, u):
+    """'preds' covers 'predators': equal, or a >=4-char prefix (plural 's' ignored)."""
+    if t == u:
+        return True
+    a, b = t.rstrip('s'), u.rstrip('s')
+    return ((a.startswith(b) and len(b) >= 4) or (b.startswith(a) and len(a) >= 4))
+
+
 def _overlap_score(g, f):
-    # Compound names split differently everywhere — the sheet says "Maddog", the
-    # file says "Mad Dog" or even "maddogeast" (or vice versa). Fuse runs of two
-    # and three adjacent tokens on both sides so either spelling covers the other;
-    # a fused game run covers ALL of its parts.
+    # Names differ every way people type them — "Maddog"/"Mad Dog"/"maddogeast",
+    # "DCE"/"DC express", "BTB"/"Be The Best", "preds"/"Predators". Cover a game
+    # token by: the same token, a fused run, an initialism (either direction), or
+    # a shared >=4-char stem. A covered run covers ALL of its parts.
+    # "vs" is a separator, never a name: left in, it hands every file a free
+    # match — and reads as the INITIALISM of any "Vs S…" run, which once scored
+    # "vs mesa" at 0.85 for the game "vs S2S".
+    g = [t for t in g if t not in ('vs', 'v')] or g
+    f = [t for t in f if t not in ('vs', 'v')] or f
     fset = set(f)
     fset |= {a + b for a, b in zip(f, f[1:])}
     fset |= {a + b + c for a, b, c in zip(f, f[1:], f[2:])}
-    covered = {t for t in g if t in fset}
-    for pair in zip(g, g[1:]):
-        if ''.join(pair) in fset:
-            covered |= set(pair)
-    for triple in zip(g, g[1:], g[2:]):
-        if ''.join(triple) in fset:
-            covered |= set(triple)
-    overlap = len(covered) / len(g)
+    fruns = list(zip(f, f[1:])) + list(zip(f, f[1:], f[2:]))
+    covered = {t for t in g
+               if t in fset
+               or any(_abbrev(t, run) for run in fruns)
+               or any(_covers(t, u) for u in f)}
+    gruns = list(zip(g, g[1:])) + list(zip(g, g[1:], g[2:]))
+    for run in gruns:
+        if ''.join(run) in fset or any(_abbrev(u, run) for u in f):
+            covered |= set(run)
+    gcover = len(covered) / len(g)
+    # A terse file fully contained in the game name ("vs 3D.mp4" for "3D New
+    # England") deserves credit too — weighted by gcover so a candidate naming
+    # MORE of the game still beats the terse one.
+    gset = set(g) | {''.join(r) for r in gruns}
+    fcover = sum(1 for u in f
+                 if u in gset
+                 or any(_abbrev(u, run) for run in gruns)
+                 or any(_covers(u, t) for t in g)) / len(f)
+    overlap = max(gcover, fcover * (0.5 + 0.5 * gcover))
     ratio = difflib.SequenceMatcher(None, ' '.join(g), ' '.join(f)).ratio()
     return 0.6 * overlap + 0.4 * ratio
 
@@ -774,6 +822,65 @@ def render_preview_video(segs, probes, ffmpeg, log=lambda m: None):
     return out
 
 
+# ------------------------------------------------------------ whistle check
+
+def _pcm(ffmpeg, src, start, dur, filters=None):
+    """Mono 8kHz 16-bit samples for a window of the source's audio."""
+    import array
+    cmd = [ffmpeg, '-v', 'error', '-ss', f'{max(start, 0):.2f}', '-i', str(src),
+           '-t', f'{dur:.2f}', '-vn', '-ac', '1', '-ar', '8000']
+    if filters:
+        cmd += ['-af', filters]
+    out = subprocess.run(cmd + ['-f', 's16le', '-'],
+                         capture_output=True, check=True).stdout
+    a = array.array('h')
+    a.frombytes(out[:len(out) // 2 * 2])
+    return a
+
+
+def whistle_score(ffmpeg, src, sec, back=1.0, ahead=4.0):
+    """How whistle-like is the loudest moment near `sec`? 0..~1, or None.
+
+    A referee's whistle is a LOUD, sustained, near-pure tone around 2-4.5kHz —
+    in a 0.1s window it dominates the signal, where crowd/announcer energy sits
+    mostly below 2kHz. Score = the best high-band/full-band energy ratio of any
+    non-quiet window in [sec-back, sec+ahead]. A goal clip is cut to end at the
+    goal, so the whistle lands just after `sec` = the clip's end.
+
+    Returns None when the window has no usable audio (no audio stream at all,
+    or a track of pure digital silence) — no verdict, not a failing one.
+    """
+    dur = back + ahead
+    try:
+        full = _pcm(ffmpeg, src, sec - back, dur)
+    except subprocess.CalledProcessError:
+        return None                                  # no audio stream to decode
+    n, win = len(full), 800                          # 0.1s at 8kHz
+    if n < win:
+        return None
+    energies = [sum(x * x for x in full[i:i + win]) / win
+                for i in range(0, n - win, win // 2)]
+    if max(energies) < 1e4:
+        return None                                  # silent track: nothing to hear
+    band = _pcm(ffmpeg, src, sec - back, dur, 'highpass=f=2200,lowpass=f=4500')
+    n = min(n, len(band))
+    loud = sorted(energies)[len(energies) // 2]
+    best = 0.0
+    for i in range(0, n - win, win // 2):
+        fe = sum(x * x for x in full[i:i + win]) / win
+        if fe < max(loud * 0.5, 1e4):                # skip lulls: whistles are loud
+            continue
+        be = sum(x * x for x in band[i:i + win]) / win
+        best = max(best, be / fe)
+    return best
+
+
+# Tuned on this library's real tape: sampled true goal cuts score 0.22-0.60; a
+# random moment scores 0 about half the time (lacrosse is full of whistles, so
+# presence is weak evidence — ABSENCE after a "goal" is what's worth flagging).
+WHISTLE_MIN = 0.2
+
+
 def open_media(path):
     """Open a file in the OS default video player."""
     if sys.platform == 'darwin':
@@ -795,11 +902,12 @@ LABEL_POSITIONS = ('top left', 'top center', 'top right',
 POS_PCT_RE = re.compile(r'\s*([\d.]+)%\s*,\s*([\d.]+)%\s*$')
 
 # The user's own Premiere template (Darsh_template.prproj), decoded from its
-# "GOAL VS TEAM..." text layer: Futura-Medium at 122px on a 3840x2160 sequence
-# (= 61 in this app's 1080p-relative size units), default white fill, left edge
-# 17.4% in, baseline ~82% down. Fonts listed most-specific first per platform.
+# "GOAL VS TEAM..." text layer: Futura-Medium at 122px on a 3840x2160 sequence,
+# text at (17.4%, 82%) INSIDE a graphic that Motion then scales 141% about
+# center at (0.494, 0.5). Net effect on screen: ~172px (= 86 at 1080p) with the
+# text tucked into the bottom-left corner at (3.4%, ~96%).
 DARSH_STYLE = {
-    'size': 61, 'color': '#ffffff', 'pos': '17.4%,83.4%',
+    'size': 86, 'color': '#ffffff', 'pos': '3.4%,96%',
     'fonts': ('/System/Library/Fonts/Supplemental/Futura.ttc',
               '/Library/Fonts/Futura.ttc',
               'C:/Windows/Fonts/Futura.ttc', 'C:/Windows/Fonts/futura.ttf',

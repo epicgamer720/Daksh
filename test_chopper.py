@@ -25,6 +25,10 @@ assert parse_range('52:10-52:17') == (3130, 3137)
 assert parse_range('1:00:10 – 1:00:20') == (3610, 3620)   # en-dash + spaces
 assert parse_range('Clip in Folder') is None
 assert parse_range('') is None
+# real sheets arrive with shift-slip typos: ';' for ':' and a dropped leading zero
+assert parse_range('11:07 - 11;14') == (667, 674)
+assert parse_range(':52 - :57') == (52, 57)
+assert parse_tc(';52') == 52
 
 # --- matching ---------------------------------------------------------------
 assert norm_tokens('Georgetown Prep #2 (Daksh)') == ['georgetown', 'prep', '2']
@@ -239,6 +243,21 @@ with tempfile.TemporaryDirectory() as td:
 # fields a Maddog East AND a Maddog West.)
 assert match_score('Maddog West', '3d 29 vs Mad Dog West Great 8') > 0.7
 assert match_score('Mad Dog East', 'vs maddogeast') > 0.55        # fused the other way
+# initialisms both directions, sheet or file: DCE=DC Express, BTB=Be The Best,
+# PT=Prime Time, NL=Next level — and 'preds' is 'Predators', 'ten' is '10'
+assert match_score('vs DCE', 'vs DC express') > 0.7
+assert match_score('vs Be The Best', 'vs BTB') > 0.7
+assert match_score('vs Prime Time', 'vs PT') > 0.7
+assert match_score('Next level', 'vs NL') > 0.55
+assert match_score('vs Predators', 'vs preds') > 0.7
+assert match_score('Team 10', 'vs team ten') > 0.7
+assert norm_tokens('vs team ten') == ['vs', 'team', '10']
+# 'vs' is a separator, never a name: it must not hand 'vs mesa' a score for
+# the game 'vs S2S' (it once read as the initialism of 'Vs S2s' and did)
+assert match_score('vs S2S', '2028- vs S2S') > match_score('vs S2S', 'vs mesa') + 0.3
+# a terse file fully contained in the game still loses to one naming more of it
+assert match_score('vs 3D New England', 'vs 3D') > 0.4
+assert match_score('vs 3D Garden State', 'vs GS') > match_score('vs 3D Garden State', 'vs 3D')
 assert qualifiers_fit(['maddog', 'east'], ['maddog', 'east'], []) is True
 assert qualifiers_fit(['maddog', 'east'], ['maddog', 'west'], []) is False
 assert qualifiers_fit(['maddog', 'east'], ['maddog'], []) is True   # unmarked survives
@@ -566,6 +585,22 @@ if _ff:
         kinds = sorted(s['codec_type'] for s in streams['streams'])
         assert kinds == ['audio', 'video'], kinds
 
+        # whistle detection: a 3kHz blast over crowd noise reads as a whistle,
+        # plain crowd noise does not, and a silent track gives NO verdict
+        from chopper import whistle_score, WHISTLE_MIN
+        wf = Path(td) / 'whistle.mp4'
+        _psub.run([ffmpeg_bin, '-y', '-hide_banner', '-loglevel', 'error',
+                   '-f', 'lavfi', '-i', 'anoisesrc=color=brown:amplitude=0.25:duration=12',
+                   '-f', 'lavfi', '-i',
+                   'sine=frequency=3000:duration=1.2,adelay=8000|8000,volume=3',
+                   '-filter_complex', '[0][1]amix=inputs=2:duration=first',
+                   '-c:a', 'aac', str(wf)], capture_output=True, check=True)
+        s_at = whistle_score(ffmpeg_bin, wf, 8.0, back=0.5, ahead=2.5)
+        s_off = whistle_score(ffmpeg_bin, wf, 3.0, back=0.5, ahead=2.5)
+        assert s_at is not None and s_at >= WHISTLE_MIN, s_at
+        assert s_off is not None and s_off < s_at, (s_off, s_at)
+        assert whistle_score(ffmpeg_bin, srcs['mute.mp4'], 1.5) is None  # no audio
+
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 
 # --- usage ping --------------------------------------------------------------
@@ -709,11 +744,11 @@ with tempfile.TemporaryDirectory() as td:
     bl, bt, br, bb = Image.open(png_pct).getchannel('A').getbbox()
     assert br <= 640 and bb <= 360, (bl, bt, br, bb)
 
-# the baked-in template style ("Darsh_template.prproj": Futura-Medium, 122px at
-# 2160p = 61 at 1080p, white, left edge 17.4% in) must stay a valid pos/color/size
+# the baked-in template style ("Darsh_template.prproj": Futura-Medium 122px at
+# 2160p, x1.41 Motion scale = 86 at 1080p, bottom-left corner) must stay valid
 from chopper import DARSH_STYLE, POS_PCT_RE, style_font
 assert POS_PCT_RE.fullmatch(DARSH_STYLE['pos'])
-assert DARSH_STYLE['size'] == 61 and DARSH_STYLE['color'] == '#ffffff'
+assert DARSH_STYLE['size'] == 86 and DARSH_STYLE['color'] == '#ffffff'
 f = style_font()
 assert f == '' or Path(f).exists()      # machine-dependent, but never a broken path
 
