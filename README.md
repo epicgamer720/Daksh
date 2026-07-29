@@ -32,7 +32,9 @@ Requires Python 3 from [python.org](https://python.org).
    belongs in the hole. Rows with no video but a good timecode are left as gaps too.
 4. Optional: turn on **Add clip labels as text in the timeline** and pick your font file + size.
    Check **+ team** to append the opponent from the sheet ("Goal" → "Goal vs Sweetlax").
-   **Preview…** shows the label on a real frame from your footage — tune the size right there.
+   **Preview…** opens the label editor on a real frame from your footage: edit the words,
+   size, **color**, and **position** (nine spots on the frame) live — every tweak is saved
+   and Generate renders exactly what you see.
 5. **Preview timeline** shows the sequence — clips, gaps, thumbnails — before you ever open
    Premiere. Click a block to select its row; double-click a block to **watch that clip**,
    or hit **▶ Watch video** to watch the whole timeline as an actual video (clips in order,

@@ -11,8 +11,8 @@ from chopper import (Row, age_groups_of, build_xmeml, clean_team, filter_age_gro
                      find_columns, label_text, list_age_groups, list_videos,
                      match_score, match_videos, norm_tokens, opponent_tokens,
                      parse_range, parse_sheet, parse_tc, place_kind,
-                     render_label_png, sanitize_filename, timeline_layout,
-                     video_age_groups)
+                     qualifiers_fit, render_label_png, sanitize_filename,
+                     timeline_layout, video_age_groups)
 
 HERE = Path(__file__).parent
 
@@ -231,6 +231,39 @@ with tempfile.TemporaryDirectory() as td:
         match_videos([r], summer)
         assert r.src, game
         assert any('ambiguous' in f for f in r.flags), (game, r.flags)
+
+# --- compound names and team qualifiers ---------------------------------------
+# The sheet says "Maddog", the file says "Mad Dog" — either spelling must cover
+# the other. And East/West are IDENTITY, like digits: "Maddog West" must never
+# take the East tape just because the club name agrees. (Real failure: the club
+# fields a Maddog East AND a Maddog West.)
+assert match_score('Maddog West', '3d 29 vs Mad Dog West Great 8') > 0.7
+assert match_score('Mad Dog East', 'vs maddogeast') > 0.55        # fused the other way
+assert qualifiers_fit(['maddog', 'east'], ['maddog', 'east'], []) is True
+assert qualifiers_fit(['maddog', 'east'], ['maddog', 'west'], []) is False
+assert qualifiers_fit(['maddog', 'east'], ['maddog'], []) is True   # unmarked survives
+# our own team's color must never disqualify a file — only the opponent half counts
+assert qualifiers_fit(['sweetlax', 'white'],
+                      opponent_tokens(norm_tokens('3d NE Red 2029 vs Sweetlax White')),
+                      []) is True
+# a folder that names the game carries its qualifier; one that doesn't claims nothing
+assert qualifiers_fit(['maddog', 'east'], ['game1'], [{'maddog', 'west'}]) is False
+assert qualifiers_fit(['maddog', 'east'], ['game1'], [{'gold', 'bracket'}]) is True
+
+with tempfile.TemporaryDirectory() as td:
+    (Path(td) / 'vs maddog east.mp4').touch()
+    (Path(td) / '3d 29 vs Mad Dog West Great 8.mp4').touch()
+    r_e = Row(sheet_row=2, game='Maddog East', start=1.0, end=2.0)
+    r_w = Row(sheet_row=3, game='Maddog West', start=1.0, end=2.0)
+    match_videos([r_e, r_w], td)
+    assert r_e.src and r_e.src.name == 'vs maddog east.mp4', r_e.src
+    assert not r_e.flags, r_e.flags
+    assert r_w.src and 'West' in r_w.src.name, r_w.src
+    assert not r_w.flags, r_w.flags
+    # a game naming NO qualifier still sees both tapes (and gets flagged ambiguous)
+    r_m = Row(sheet_row=4, game='Maddog', start=1.0, end=2.0)
+    match_videos([r_m], td)
+    assert r_m.src is not None
 
 # --- age groups ---------------------------------------------------------------
 # One club, several age groups: each tournament folder holds 2027/…/2031 with
@@ -647,6 +680,23 @@ with tempfile.TemporaryDirectory() as td:
     png4k = Path(td) / 'lbl4k.png'
     render_label_png('Goal', None, 48, 3840, 2160, png4k)
     assert Image.open(png4k).size == (3840, 2160)
+
+    # color and position are honored: red text lands in the top-right quadrant
+    png_tr = Path(td) / 'tr.png'
+    render_label_png('GOAL', None, 48, 640, 360, png_tr, color='#ff0000', pos='top right')
+    im_tr = Image.open(png_tr)
+    bl, bt, br, bb = im_tr.getchannel('A').getbbox()
+    assert bl >= 320 and bb <= 180, (bl, bt, br, bb)
+    reds = [im_tr.getpixel((x, y)) for y in range(bt, bb) for x in range(bl, br)
+            if im_tr.getpixel((x, y))[3] > 200]
+    assert any(p[0] > 200 and p[1] < 80 for p in reds)     # the fill really is red
+    # bottom center is centered horizontally and low
+    png_bc = Path(td) / 'bc.png'
+    render_label_png('GOAL', None, 48, 640, 360, png_bc, pos='bottom center')
+    bl, bt, br, bb = Image.open(png_bc).getchannel('A').getbbox()
+    assert bt >= 180 and abs((bl + br) / 2 - 320) < 30, (bl, bt, br, bb)
+    # a junk color falls back to white instead of crashing
+    render_label_png('GOAL', None, 48, 640, 360, png_bc, color='not-a-color')
 
 # second video track with one still per labeled row, aligned to its clip
 xml_l = build_xmeml(test_rows, probes, 'Seq', {0: Path('lbl.png')})

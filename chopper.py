@@ -368,6 +368,40 @@ def digits_fit(game_toks, digits, stem_toks, comp_toks):
     return digits <= carriers
 
 
+# Words that split one club into several teams, grouped by axis. Like digits, these
+# are IDENTITY: "Maddog East" must never take a tape marked West just because the
+# club name agrees.
+QUALIFIER_AXES = (
+    {'east', 'west', 'north', 'south'},
+    {'red', 'white', 'blue', 'black', 'green', 'gold', 'grey', 'gray', 'orange', 'silver'},
+)
+
+
+def qualifiers_fit(game_toks, opp_toks, comp_toks):
+    """Does this file avoid claiming a CONFLICTING team qualifier?
+
+    Checked against the opponent half of the filename (after "vs") plus folders
+    that name the game, never our own team's half — "3d NE Red 2029 vs Sweetlax
+    White" says Red about US, and must still fit a game named "Sweetlax White".
+    A file naming the game's own qualifier anywhere survives; one naming only a
+    rival qualifier is killed.
+    """
+    words = {t for t in game_toks if not t.isdigit()
+             and not any(t in axis for axis in QUALIFIER_AXES)}
+    carriers = set(opp_toks)
+    for toks in comp_toks:
+        if toks & words:      # "Gold bracket/" claims nothing about a game it doesn't name
+            carriers |= toks
+    for axis in QUALIFIER_AXES:
+        named = axis & set(game_toks)
+        if not named:
+            continue
+        claimed = axis & carriers
+        if claimed and not (named & claimed):
+            return False
+    return True
+
+
 def opponent_tokens(toks):
     """The part of a file name after "vs" — game film is named "<us> vs <them>".
 
@@ -383,7 +417,21 @@ def opponent_tokens(toks):
 
 
 def _overlap_score(g, f):
-    overlap = len(set(g) & set(f)) / len(g)
+    # Compound names split differently everywhere — the sheet says "Maddog", the
+    # file says "Mad Dog" or even "maddogeast" (or vice versa). Fuse runs of two
+    # and three adjacent tokens on both sides so either spelling covers the other;
+    # a fused game run covers ALL of its parts.
+    fset = set(f)
+    fset |= {a + b for a, b in zip(f, f[1:])}
+    fset |= {a + b + c for a, b, c in zip(f, f[1:], f[2:])}
+    covered = {t for t in g if t in fset}
+    for pair in zip(g, g[1:]):
+        if ''.join(pair) in fset:
+            covered |= set(pair)
+    for triple in zip(g, g[1:], g[2:]):
+        if ''.join(triple) in fset:
+            covered |= set(triple)
+    overlap = len(covered) / len(g)
     ratio = difflib.SequenceMatcher(None, ' '.join(g), ' '.join(f)).ratio()
     return 0.6 * overlap + 0.4 * ratio
 
@@ -413,6 +461,7 @@ def match_videos(rows, folders, threshold=0.55, exclude=None, videos=None):
     # its tournament folder still gets found.
     rels = {v: rel_to_root(v, roots) for v in videos}
     stem_toks = {v: set(norm_tokens(rels[v].stem)) for v in videos}
+    opp_toks = {v: set(opponent_tokens(norm_tokens(rels[v].stem))) for v in videos}
     comp_toks = {v: [set(norm_tokens(p)) for p in rels[v].parts[:-1]] for v in videos}
     labels = {v: ' '.join(rels[v].parts[:-1] + (rels[v].stem,)).strip() for v in videos}
     cache = {}
@@ -428,7 +477,8 @@ def match_videos(rows, folders, threshold=0.55, exclude=None, videos=None):
             game_toks = norm_tokens(r.game)
             digits = {t for t in game_toks if t.isdigit()}
             pool = [v for v in videos
-                    if digits_fit(game_toks, digits, stem_toks[v], comp_toks[v])]
+                    if digits_fit(game_toks, digits, stem_toks[v], comp_toks[v])
+                    and qualifiers_fit(game_toks, opp_toks[v], comp_toks[v])]
             # Sitting in a folder the game names is evidence, never a filter: nudge those
             # candidates up rather than dropping the rest, or a tape filed outside its
             # tournament folder would vanish and a wrong one would win unflagged.
@@ -736,24 +786,43 @@ def open_media(path):
 
 # ------------------------------------------------------------ label graphics
 
-def render_label_png(text, font_path, size, width, height, out_path):
-    """Full-frame transparent PNG with the label bottom-left — a Premiere overlay still.
+LABEL_POSITIONS = ('top left', 'top center', 'top right',
+                   'middle center',
+                   'bottom left', 'bottom center', 'bottom right')
+
+
+def render_label_png(text, font_path, size, width, height, out_path,
+                     color='#ffffff', pos='bottom left'):
+    """Full-frame transparent PNG with the label — a Premiere overlay still.
 
     `size` means pixels at 1080p; scaled proportionally for other sequence heights.
+    `pos` is '<top|middle|bottom> <left|center|right>'; `color` any hex/named color.
     """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageColor, ImageDraw, ImageFont
     px = max(8, round(size * height / 1080))
     try:
         font = ImageFont.truetype(str(font_path), px) if font_path else ImageFont.load_default(px)
     except Exception:
         font = ImageFont.load_default(px)
+    try:
+        rgb = ImageColor.getrgb(color)[:3]
+    except ValueError:
+        rgb = (255, 255, 255)
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     margin = round(height * 0.05)
-    stroke = max(2, px // 24)  # slim dark outline so white text survives bright footage
+    stroke = max(2, px // 24)  # slim outline so the text survives busy footage
     l, t, r, b = d.textbbox((0, 0), text, font=font, stroke_width=stroke)
-    d.text((margin - l, height - margin - (b - t) - t), text, font=font,
-           fill=(255, 255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0, 200))
+    tw, th = r - l, b - t
+    vert, _, horiz = pos.partition(' ')
+    x = {'left': margin, 'center': (width - tw) // 2,
+         'right': width - margin - tw}.get(horiz, margin)
+    y = {'top': margin, 'middle': (height - th) // 2,
+         'bottom': height - margin - th}.get(vert, height - margin - th)
+    # the outline flips to keep contrast: dark behind bright text, light behind dark
+    dark_text = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2] < 100
+    d.text((x - l, y - t), text, font=font, fill=rgb + (255,), stroke_width=stroke,
+           stroke_fill=(255, 255, 255, 220) if dark_text else (0, 0, 0, 200))
     img.save(out_path)
 
 
@@ -902,9 +971,9 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
 
     Rows toggled off — or with no video but a known length — stay as gaps in the
     timeline instead of shifting everything after them.
-    labels_cfg: optional {'font': Path|None, 'size': int, 'team': bool} — render each
-    row's label as a still-image overlay on a second timeline track; 'team' appends
-    'vs <game>' from the sheet.
+    labels_cfg: optional {'font': Path|None, 'size': int, 'team': bool, 'color': str,
+    'pos': str} — render each row's label as a still-image overlay on a second
+    timeline track; 'team' appends 'vs <game>' from the sheet.
     """
     ffmpeg, ffprobe = find_ffmpeg()
     rows = [r for r in rows if place_kind(r)]
@@ -1001,7 +1070,9 @@ def generate(rows, out_dir, sequence_name, export_clips, log, labels_cfg=None):
                 png = label_dir / f'{sanitize_filename(text)}.png'
                 try:
                     render_label_png(text, labels_cfg.get('font'), labels_cfg.get('size', 48),
-                                     first['width'], first['height'], png)
+                                     first['width'], first['height'], png,
+                                     color=labels_cfg.get('color', '#ffffff'),
+                                     pos=labels_cfg.get('pos', 'bottom left'))
                     by_text[text] = png
                 except Exception as e:
                     by_text[text] = None
@@ -1125,7 +1196,7 @@ def fmt_tc(sec):
 
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import colorchooser, filedialog, messagebox, ttk
     DND_FILES, dnd_error = None, None
     try:
         ensure_pip('tkinterdnd2', 'tkinterdnd2')   # may be missing if run outside the launcher
@@ -1208,6 +1279,8 @@ def run_gui():
     font_var = tk.StringVar(value=cfg.get('font', ''))
     size_var = tk.StringVar(value=str(cfg.get('size', 48)))
     team_var = tk.BooleanVar(value=cfg.get('label_team', False))
+    color_var = tk.StringVar(value=cfg.get('label_color', '#ffffff'))
+    pos_var = tk.StringVar(value=cfg.get('label_pos', 'bottom left'))
     ttk.Checkbutton(bot, text='Add clip labels as text in the timeline',
                     variable=labels_var).grid(row=0, column=0, sticky='w')
     font_frame = ttk.Frame(bot)
@@ -1547,9 +1620,11 @@ def run_gui():
             if lfont and not lfont.exists():
                 log(f'Font file not found ({lfont}) — using default font')
                 lfont = None
-            labels_cfg = {'font': lfont, 'size': lsize, 'team': team_var.get()}
+            labels_cfg = {'font': lfont, 'size': lsize, 'team': team_var.get(),
+                          'color': color_var.get(), 'pos': pos_var.get()}
         cfg.update({'labels_on': labels_var.get(), 'font': font_var.get(),
-                    'size': lsize, 'export_clips': export, 'label_team': team_var.get()})
+                    'size': lsize, 'export_clips': export, 'label_team': team_var.get(),
+                    'label_color': color_var.get(), 'label_pos': pos_var.get()})
         save_settings(cfg)
 
         def work():
@@ -1788,7 +1863,7 @@ def run_gui():
         threading.Thread(target=worker, daemon=True).start()
 
     def preview_label():
-        """Show the label text on a real frame at the current font/size — tune before Generate."""
+        """The label editor: text, size, color, position — live on a real frame."""
         team_on = team_var.get()
         sel = [r for r in selected_rows() if r.src]
         cand = (sel or [r for r in state['rows'] if r.src and label_text(r, team_on)]
@@ -1805,7 +1880,6 @@ def run_gui():
         img_lbl.pack(fill='both', expand=True, padx=8, pady=(8, 0))
         bar = ttk.Frame(win, padding=8)
         bar.pack(side='bottom', fill='x')
-        ttk.Label(bar, text='Size:').pack(side='left')
 
         def render_pass(n):
             """Off the UI thread: composite label onto the cached frame, then hand back."""
@@ -1823,7 +1897,8 @@ def run_gui():
                 if text:
                     lbl_png = tdir / 'label.png'
                     font = Path(font_var.get()) if font_var.get() else None
-                    render_label_png(text, font, size, w, h, lbl_png)
+                    render_label_png(text, font, size, w, h, lbl_png,
+                                     color=color_var.get(), pos=pos_var.get())
                     base = Image.alpha_composite(base, Image.open(lbl_png).convert('RGBA'))
                 scale = min(880 / base.width, 500 / base.height, 1.0)
                 view = tdir / f'view{n}.png'
@@ -1847,21 +1922,58 @@ def run_gui():
                 root.after(0, lambda m=msg: alive['ok'] and img_lbl.configure(text=m, image=''))
 
         def schedule(*_):
+            try:
+                cfg.update({'size': max(8, int(float(size_var.get())))})
+            except ValueError:
+                pass
+            cfg.update({'label_team': team_var.get(), 'font': font_var.get(),
+                        'label_color': color_var.get(), 'label_pos': pos_var.get()})
+            save_settings(cfg)      # every tweak sticks — Generate uses exactly this
             holder['n'] += 1
             n = holder['n']
             win.after(250, lambda: holder['n'] == n and threading.Thread(
                 target=render_pass, args=(n,), daemon=True).start())
 
+        # row 0: the words — edits this row's Label directly, same as the table cell
+        ttk.Label(bar, text='Label:').grid(row=0, column=0, sticky='w')
+        text_var = tk.StringVar(value=r.label)
+
+        def on_text(*_):
+            r.label = text_var.get().strip()
+            schedule()
+        text_entry = ttk.Entry(bar, textvariable=text_var)
+        text_entry.grid(row=0, column=1, columnspan=6, sticky='ew', padx=(4, 0))
+        text_entry.bind('<KeyRelease>', on_text)
+
+        # row 1: how it looks
+        ttk.Label(bar, text='Size:').grid(row=1, column=0, sticky='w', pady=(6, 0))
         spin = ttk.Spinbox(bar, from_=8, to=300, increment=4, textvariable=size_var,
                            width=5, command=schedule)
-        spin.pack(side='left', padx=(4, 0))
+        spin.grid(row=1, column=1, sticky='w', padx=(4, 0), pady=(6, 0))
         spin.bind('<KeyRelease>', schedule)
+        swatch = tk.Label(bar, width=2, background=color_var.get(), relief='sunken')
+
+        def pick_color():
+            c = colorchooser.askcolor(color=color_var.get(), parent=win,
+                                      title='Label color')
+            if c and c[1]:
+                color_var.set(c[1])
+                swatch.configure(background=c[1])
+                schedule()
+        ttk.Button(bar, text='Color…', command=pick_color).grid(row=1, column=2,
+                                                                padx=(10, 2), pady=(6, 0))
+        swatch.grid(row=1, column=3, pady=(6, 0))
+        pos_box = ttk.Combobox(bar, textvariable=pos_var, state='readonly', width=13,
+                               values=list(LABEL_POSITIONS))
+        pos_box.grid(row=1, column=4, padx=(10, 0), pady=(6, 0))
+        pos_box.bind('<<ComboboxSelected>>', schedule)
         ttk.Checkbutton(bar, text='+ team', variable=team_var,
-                        command=schedule).pack(side='left', padx=(10, 0))
+                        command=schedule).grid(row=1, column=5, padx=(10, 0), pady=(6, 0))
         ttk.Button(bar, text='Font…',
-                   command=lambda: (pick_font(), schedule())).pack(side='left', padx=(10, 0))
-        ttk.Label(bar, foreground='#666',
-                  text='(size is saved — Generate uses exactly this)').pack(side='left', padx=(10, 0))
+                   command=lambda: (pick_font(), schedule())).grid(row=1, column=6,
+                                                                  sticky='w', padx=(10, 0),
+                                                                  pady=(6, 0))
+        bar.columnconfigure(6, weight=1)
 
         def first_grab():
             try:
@@ -1888,6 +2000,7 @@ def run_gui():
             win.destroy()
             if holder.get('tdir'):
                 shutil.rmtree(holder['tdir'], ignore_errors=True)
+            refresh_table()     # label edits made here show up in the table
         win.protocol('WM_DELETE_WINDOW', on_close)
         win.bind('<Escape>', lambda e: on_close())
         threading.Thread(target=first_grab, daemon=True).start()
