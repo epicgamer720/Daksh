@@ -698,6 +698,25 @@ with tempfile.TemporaryDirectory() as td:
     # a junk color falls back to white instead of crashing
     render_label_png('GOAL', None, 48, 640, 360, png_bc, color='not-a-color')
 
+    # free percentage positions — how the Premiere template places text: left edge
+    # at X%, bottom at Y%
+    png_pct = Path(td) / 'pct.png'
+    render_label_png('GOAL', None, 48, 640, 360, png_pct, pos='50%,50%')
+    bl, bt, br, bb = Image.open(png_pct).getchannel('A').getbbox()
+    assert abs(bl - 320) <= 6 and abs(bb - 180) <= 6, (bl, bt, br, bb)
+    # a nudge can't push the text off-frame
+    render_label_png('GOAL', None, 48, 640, 360, png_pct, pos='99%,99%')
+    bl, bt, br, bb = Image.open(png_pct).getchannel('A').getbbox()
+    assert br <= 640 and bb <= 360, (bl, bt, br, bb)
+
+# the baked-in template style ("Darsh_template.prproj": Futura-Medium, 122px at
+# 2160p = 61 at 1080p, white, left edge 17.4% in) must stay a valid pos/color/size
+from chopper import DARSH_STYLE, POS_PCT_RE, style_font
+assert POS_PCT_RE.fullmatch(DARSH_STYLE['pos'])
+assert DARSH_STYLE['size'] == 61 and DARSH_STYLE['color'] == '#ffffff'
+f = style_font()
+assert f == '' or Path(f).exists()      # machine-dependent, but never a broken path
+
 # second video track with one still per labeled row, aligned to its clip
 xml_l = build_xmeml(test_rows, probes, 'Seq', {0: Path('lbl.png')})
 root_l = ET.fromstring(xml_l)

@@ -790,6 +790,30 @@ LABEL_POSITIONS = ('top left', 'top center', 'top right',
                    'middle center',
                    'bottom left', 'bottom center', 'bottom right')
 
+# A position can also be a free point: '17.4%,83.4%' puts the text's left edge
+# 17.4% in from the left with its bottom 83.4% down — how Premiere places text.
+POS_PCT_RE = re.compile(r'\s*([\d.]+)%\s*,\s*([\d.]+)%\s*$')
+
+# The user's own Premiere template (Darsh_template.prproj), decoded from its
+# "GOAL VS TEAM..." text layer: Futura-Medium at 122px on a 3840x2160 sequence
+# (= 61 in this app's 1080p-relative size units), default white fill, left edge
+# 17.4% in, baseline ~82% down. Fonts listed most-specific first per platform.
+DARSH_STYLE = {
+    'size': 61, 'color': '#ffffff', 'pos': '17.4%,83.4%',
+    'fonts': ('/System/Library/Fonts/Supplemental/Futura.ttc',
+              '/Library/Fonts/Futura.ttc',
+              'C:/Windows/Fonts/Futura.ttc', 'C:/Windows/Fonts/futura.ttf',
+              'C:/Windows/Fonts/futuram.ttf'),
+}
+
+
+def style_font(style=DARSH_STYLE):
+    """First of the style's font files present on this machine, or ''."""
+    for p in style['fonts']:
+        if Path(p).exists():
+            return p
+    return ''
+
 
 def render_label_png(text, font_path, size, width, height, out_path,
                      color='#ffffff', pos='bottom left'):
@@ -814,11 +838,17 @@ def render_label_png(text, font_path, size, width, height, out_path,
     stroke = max(2, px // 24)  # slim outline so the text survives busy footage
     l, t, r, b = d.textbbox((0, 0), text, font=font, stroke_width=stroke)
     tw, th = r - l, b - t
-    vert, _, horiz = pos.partition(' ')
-    x = {'left': margin, 'center': (width - tw) // 2,
-         'right': width - margin - tw}.get(horiz, margin)
-    y = {'top': margin, 'middle': (height - th) // 2,
-         'bottom': height - margin - th}.get(vert, height - margin - th)
+    if m := POS_PCT_RE.fullmatch(pos or ''):
+        x = round(width * float(m.group(1)) / 100)
+        y = round(height * float(m.group(2)) / 100) - th
+    else:
+        vert, _, horiz = (pos or '').partition(' ')
+        x = {'left': margin, 'center': (width - tw) // 2,
+             'right': width - margin - tw}.get(horiz, margin)
+        y = {'top': margin, 'middle': (height - th) // 2,
+             'bottom': height - margin - th}.get(vert, height - margin - th)
+    x = max(0, min(x, width - tw))     # never let a nudge push the text off-frame
+    y = max(0, min(y, height - th))
     # the outline flips to keep contrast: dark behind bright text, light behind dark
     dark_text = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2] < 100
     d.text((x - l, y - t), text, font=font, fill=rgb + (255,), stroke_width=stroke,
@@ -1927,12 +1957,17 @@ def run_gui():
             except ValueError:
                 pass
             cfg.update({'label_team': team_var.get(), 'font': font_var.get(),
-                        'label_color': color_var.get(), 'label_pos': pos_var.get()})
+                        'label_color': color_var.get(), 'label_pos': pos_var.get(),
+                        'label_style': style_var.get()})
             save_settings(cfg)      # every tweak sticks — Generate uses exactly this
             holder['n'] += 1
             n = holder['n']
             win.after(250, lambda: holder['n'] == n and threading.Thread(
                 target=render_pass, args=(n,), daemon=True).start())
+
+        def touched(*_):
+            style_var.set('Custom')     # a hand tweak means it's your style now
+            schedule()
 
         # row 0: the words — edits this row's Label directly, same as the table cell
         ttk.Label(bar, text='Label:').grid(row=0, column=0, sticky='w')
@@ -1942,16 +1977,39 @@ def run_gui():
             r.label = text_var.get().strip()
             schedule()
         text_entry = ttk.Entry(bar, textvariable=text_var)
-        text_entry.grid(row=0, column=1, columnspan=6, sticky='ew', padx=(4, 0))
+        text_entry.grid(row=0, column=1, columnspan=8, sticky='ew', padx=(4, 0))
         text_entry.bind('<KeyRelease>', on_text)
 
         # row 1: how it looks
-        ttk.Label(bar, text='Size:').grid(row=1, column=0, sticky='w', pady=(6, 0))
-        spin = ttk.Spinbox(bar, from_=8, to=300, increment=4, textvariable=size_var,
-                           width=5, command=schedule)
-        spin.grid(row=1, column=1, sticky='w', padx=(4, 0), pady=(6, 0))
-        spin.bind('<KeyRelease>', schedule)
+        style_var = tk.StringVar(value=cfg.get('label_style', 'Custom'))
         swatch = tk.Label(bar, width=2, background=color_var.get(), relief='sunken')
+
+        def apply_style(_e=None):
+            if style_var.get() != 'Darsh template':
+                schedule()
+                return
+            size_var.set(str(DARSH_STYLE['size']))
+            color_var.set(DARSH_STYLE['color'])
+            swatch.configure(background=DARSH_STYLE['color'])
+            pos_var.set(DARSH_STYLE['pos'])
+            f = style_font()
+            if f:
+                font_var.set(f)
+                font_lbl.configure(text=Path(f).name)
+            else:
+                log('Futura not found on this machine — template style keeps your current font')
+            schedule()
+        ttk.Label(bar, text='Style:').grid(row=1, column=0, sticky='w', pady=(6, 0))
+        style_box = ttk.Combobox(bar, textvariable=style_var, state='readonly', width=13,
+                                 values=['Darsh template', 'Custom'])
+        style_box.grid(row=1, column=1, sticky='w', padx=(4, 0), pady=(6, 0))
+        style_box.bind('<<ComboboxSelected>>', apply_style)
+        ttk.Label(bar, text='Size:').grid(row=1, column=2, sticky='w',
+                                          padx=(10, 0), pady=(6, 0))
+        spin = ttk.Spinbox(bar, from_=8, to=300, increment=4, textvariable=size_var,
+                           width=5, command=touched)
+        spin.grid(row=1, column=3, sticky='w', padx=(4, 0), pady=(6, 0))
+        spin.bind('<KeyRelease>', touched)
 
         def pick_color():
             c = colorchooser.askcolor(color=color_var.get(), parent=win,
@@ -1959,21 +2017,63 @@ def run_gui():
             if c and c[1]:
                 color_var.set(c[1])
                 swatch.configure(background=c[1])
-                schedule()
-        ttk.Button(bar, text='Color…', command=pick_color).grid(row=1, column=2,
+                touched()
+        ttk.Button(bar, text='Color…', command=pick_color).grid(row=1, column=4,
                                                                 padx=(10, 2), pady=(6, 0))
-        swatch.grid(row=1, column=3, pady=(6, 0))
+        swatch.grid(row=1, column=5, pady=(6, 0))
         pos_box = ttk.Combobox(bar, textvariable=pos_var, state='readonly', width=13,
                                values=list(LABEL_POSITIONS))
-        pos_box.grid(row=1, column=4, padx=(10, 0), pady=(6, 0))
-        pos_box.bind('<<ComboboxSelected>>', schedule)
+        pos_box.grid(row=1, column=6, padx=(10, 0), pady=(6, 0))
+        pos_box.bind('<<ComboboxSelected>>', touched)
         ttk.Checkbutton(bar, text='+ team', variable=team_var,
-                        command=schedule).grid(row=1, column=5, padx=(10, 0), pady=(6, 0))
+                        command=schedule).grid(row=1, column=7, padx=(10, 0), pady=(6, 0))
         ttk.Button(bar, text='Font…',
-                   command=lambda: (pick_font(), schedule())).grid(row=1, column=6,
-                                                                  sticky='w', padx=(10, 0),
-                                                                  pady=(6, 0))
-        bar.columnconfigure(6, weight=1)
+                   command=lambda: (pick_font(), touched())).grid(row=1, column=8,
+                                                                 sticky='w', padx=(10, 0),
+                                                                 pady=(6, 0))
+        bar.columnconfigure(8, weight=1)
+        ttk.Label(bar, foreground='#666',
+                  text='click the frame to put the text there · arrow keys nudge '
+                       '(shift = bigger steps)').grid(row=2, column=0, columnspan=9,
+                                                      sticky='w', pady=(4, 0))
+
+        # fine positioning: click the frame to place, arrows to nudge
+        def on_place(e):
+            ph = holder['photo']
+            if not ph:
+                return
+            iw, ih = ph.width(), ph.height()
+            fx = min(max((e.x - (img_lbl.winfo_width() - iw) / 2) / iw, 0), 1)
+            fy = min(max((e.y - (img_lbl.winfo_height() - ih) / 2) / ih, 0), 1)
+            pos_var.set(f'{fx * 100:.1f}%,{fy * 100:.1f}%')
+            touched()
+        img_lbl.bind('<Button-1>', on_place)
+
+        NAMED_PCT = {'left': 5.0, 'center': 45.0, 'right': 80.0,
+                     'top': 10.0, 'middle': 50.0, 'bottom': 90.0}
+
+        def nudge(dx, dy):
+            if m := POS_PCT_RE.fullmatch(pos_var.get()):
+                fx, fy = float(m.group(1)), float(m.group(2))
+            else:                       # first nudge converts a corner to a free point
+                vert, _, horiz = pos_var.get().partition(' ')
+                fx, fy = NAMED_PCT.get(horiz, 5.0), NAMED_PCT.get(vert, 90.0)
+            pos_var.set(f'{min(max(fx + dx, 0), 100):.1f}%,'
+                        f'{min(max(fy + dy, 0), 100):.1f}%')
+            touched()
+
+        def on_arrow(e):
+            w = win.focus_get()         # let the text fields keep their arrow keys
+            if w is not None and w.winfo_class() in ('TEntry', 'TSpinbox', 'TCombobox',
+                                                     'Entry', 'Spinbox'):
+                return
+            step = 2.0 if e.state & 1 else 0.5
+            dx, dy = {'Left': (-step, 0), 'Right': (step, 0),
+                      'Up': (0, -step), 'Down': (0, step)}[e.keysym]
+            nudge(dx, dy)
+            return 'break'
+        for k in ('<Left>', '<Right>', '<Up>', '<Down>'):
+            win.bind(k, on_arrow)
 
         def first_grab():
             try:

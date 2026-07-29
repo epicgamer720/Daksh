@@ -33,8 +33,11 @@ Requires Python 3 from [python.org](https://python.org).
 4. Optional: turn on **Add clip labels as text in the timeline** and pick your font file + size.
    Check **+ team** to append the opponent from the sheet ("Goal" → "Goal vs Sweetlax").
    **Preview…** opens the label editor on a real frame from your footage: edit the words,
-   size, **color**, and **position** (nine spots on the frame) live — every tweak is saved
-   and Generate renders exactly what you see.
+   size, **color**, and **position** live — every tweak is saved and Generate renders
+   exactly what you see. Pick a corner from the dropdown, **click anywhere on the frame**
+   to put the text there, or nudge with the **arrow keys** (shift = bigger steps).
+   The **Style** dropdown offers **Darsh template** — the exact Futura look and placement
+   decoded from `Darsh_template.prproj` — or **Custom** (any tweak switches you there).
 5. **Preview timeline** shows the sequence — clips, gaps, thumbnails — before you ever open
    Premiere. Click a block to select its row; double-click a block to **watch that clip**,
    or hit **▶ Watch video** to watch the whole timeline as an actual video (clips in order,
