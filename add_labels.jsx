@@ -6,11 +6,13 @@
       Graphics and Titles menu > Export As Motion Graphics Template… (save anywhere).
    2. Delete that graphic from the timeline.
 
- Then after importing a Clip Chopper timeline XML:
+ Then, with your sequence open (imported timeline XML, or clips dragged in straight
+ from a numbered folder):
    File > Scripts > Run Script… > pick this file > choose your saved .mogrt.
 
- Each copy's text is set to the clip's label (the clip name minus its "01 - " prefix)
- and it spans exactly its clip. Labels land on the top video track, which must be
+ Each copy's text is set to the clip's label — the clip name minus its "01 - "
+ prefix and any file extension — and it spans exactly its clip. Clips whose label
+ starts with "intro" or "title" are skipped (no caption wanted there). Labels land on the top video track, which must be
  empty — if you generated the XML with PNG labels on, delete those or add a fresh
  track on top (right-click a track header > Add Track) before running.
 
@@ -81,7 +83,12 @@
     var added = 0, textSet = 0, failures = [];
     for (var i = 0; i < clips.numItems; i++) {
         var clip = clips[i];
-        var label = String(clip.name).replace(/^\s*\d+\s*-\s*/, '');
+        var label = String(clip.name)
+            .replace(/^\s*\d+\s*-\s*/, '')          // "07 - " slot prefix
+            .replace(/\.[A-Za-z0-9]{2,4}$/, '');    // ".mp4" when clips came in as files
+        if (/^\s*(intro|title)/i.test(label)) {
+            continue;                                // b-roll and title cards get no caption
+        }
         var item = seq.importMGT(mogrt.fsName, clip.start.ticks, target, 0);
         if (!item) {
             failures.push(clip.name);
