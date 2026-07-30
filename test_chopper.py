@@ -479,6 +479,34 @@ try:
 except ValueError as e:
     assert 'probed' in str(e)
 
+# Premiere resolves linked A/V by the clip's POSITION ON ITS TRACK. Gaps hold a
+# slot but put nothing on the track, and a mute clip advances only the video
+# track — numbering links by slot sent every link past its clip, and Premiere
+# silently dropped the whole import (a loading bar, then nothing).
+mute = HERE / 'mute_src.mp4'
+probes_l = dict(probes)
+probes_l[str(mute)] = {'fps': 29.97, 'width': 1920, 'height': 1080,
+                       'duration': 100.0, 'has_audio': False}
+lrows = [r_on, r_off,                                          # clip, gap
+         Row(sheet_row=8, game='M', start=1.0, end=4.0, src=mute),   # video-only clip
+         r_last]                                               # clip with audio
+lr = ET.fromstring(build_xmeml(lrows, probes_l, 'Links'))
+vtrack = lr.findall('.//video/track')[0].findall('clipitem')
+atrack = lr.findall('.//audio/track')[0].findall('clipitem')
+assert len(vtrack) == 3 and len(atrack) == 2                   # mute clip: no audio item
+vids_l = [c.get('id') for c in vtrack]
+aids_l = [c.get('id') for c in atrack]
+links_seen = 0
+for c in vtrack + atrack:
+    for ln in c.findall('link'):
+        ref, mt = ln.findtext('linkclipref'), ln.findtext('mediatype')
+        pool = vids_l if mt == 'video' else aids_l
+        assert ref in pool, (c.get('id'), ref)
+        assert pool.index(ref) + 1 == int(ln.findtext('clipindex')), \
+            (c.get('id'), ref, mt, ln.findtext('clipindex'))
+        links_seen += 1
+assert links_seen == 8                                         # 2 linked pairs x 2 links x 2 items
+
 # --- mixed frame rates on one timeline ---------------------------------------
 # Premiere reads every frame number on a clipitem at the SEQUENCE rate, whatever <rate>
 # the clipitem carries. Counting in/out in source frames sent 29.97 film to half its

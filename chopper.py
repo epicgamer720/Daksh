@@ -998,6 +998,7 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
     file_defs = {}   # path -> file id (emit full <file> once, then reference)
     png_defs = {}
     t = 0            # sequence playhead in frames
+    vpos = apos = 0  # 1-based clip ordinal PER TRACK — links must use track position
     for n, seg in enumerate(segs, 1):
         r = seg['row']
         start, end = seg['start'], seg['end']
@@ -1043,11 +1044,20 @@ def build_xmeml(rows, probes, sequence_name, label_pngs=None):
         else:
             file_xml = f'<file id="{file_defs[path]}"/>'
 
+        # <clipindex> is the clip's 1-based POSITION ON ITS TRACK, not the slot
+        # number: gaps hold slots but put nothing on the track, and a video-only
+        # clip advances the video track while the audio track stands still.
+        # Counting slots sent every link past its clip and Premiere silently
+        # dropped the whole import — a loading bar, then nothing.
+        vpos += 1
+        if p['has_audio']:
+            apos += 1
+
         def links(vid, aid):
             return (f'<link><linkclipref>{vid}</linkclipref><mediatype>video</mediatype>'
-                    f'<trackindex>1</trackindex><clipindex>{n}</clipindex></link>'
+                    f'<trackindex>1</trackindex><clipindex>{vpos}</clipindex></link>'
                     f'<link><linkclipref>{aid}</linkclipref><mediatype>audio</mediatype>'
-                    f'<trackindex>1</trackindex><clipindex>{n}</clipindex></link>')
+                    f'<trackindex>1</trackindex><clipindex>{apos}</clipindex></link>')
 
         vid, aid = f'clipitem-v{n}', f'clipitem-a{n}'
         common = (f'<enabled>TRUE</enabled><duration>{clip_frames}</duration>'
