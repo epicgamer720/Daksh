@@ -59,7 +59,10 @@ The timeline's label overlays are images. If you want **editable Premiere text**
 1. One-time: in Premiere, make one text graphic styled how you want (your font/size),
    select it → Graphics and Titles → **Export As Motion Graphics Template…**, then delete it.
 2. Generate/import the timeline **with the PNG-labels checkbox off** (or delete track V2).
-3. File → Scripts → **Run Script…** → pick `add_labels.jsx` → choose your saved .mogrt.
+3. Run `Install Premiere Panel.command` (Mac) or `.bat` (Windows) once, restart Premiere,
+   then **Window → Extensions (Legacy) → Clip Chopper Labels** → click the button →
+   choose your saved .mogrt. (Premiere Pro has no File → Scripts menu — that is an
+   After Effects feature; the panel is how Premiere runs scripts.)
 
 Every clip gets a native text layer above it with its label, editable in Essential Graphics.
 
