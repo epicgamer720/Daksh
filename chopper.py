@@ -2044,13 +2044,17 @@ def run_gui():
             return
         out = state['sheet'].parent / f'{sanitize_filename(state["sheet"].stem)} mogrts'
         out.mkdir(exist_ok=True)
+        for stale in out.glob('*.mogrt'):
+            stale.unlink()          # old copies would shadow renamed ones in the panel
         made = 0
         # numbering mirrors the timeline: gaps keep their slot so 'NN' always
-        # matches the clip names Premiere shows after importing the XML
+        # matches the clip names Premiere shows after importing the XML.
+        # The team is ALWAYS appended — a caption without the opponent is the
+        # one thing a "GOAL VS TEAM..." template can never want.
         for n, seg in enumerate(timeline_layout(rows, cached_probes(rows)), 1):
             if seg['kind'] != 'clip':
                 continue
-            text = label_text(seg['row'], team_var.get()).upper()
+            text = label_text(seg['row'], True).upper()
             if not text:
                 continue
             try:
