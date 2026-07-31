@@ -1449,6 +1449,8 @@ def run_gui():
                     variable=team_var).pack(side='left', padx=(10, 0))
     ttk.Button(font_frame, text='Preview…',
                command=lambda: preview_label()).pack(side='left', padx=(8, 0))
+    ttk.Button(font_frame, text='Mogrts…',
+               command=lambda: make_mogrts()).pack(side='left', padx=(4, 0))
 
     export_var = tk.BooleanVar(value=cfg.get('export_clips', True))
     ttk.Style().configure('Big.TCheckbutton', font=('TkDefaultFont', 10, 'bold'))
@@ -2009,6 +2011,56 @@ def run_gui():
         win.bind('<Escape>', lambda e: on_close())
         draw()
         threading.Thread(target=worker, daemon=True).start()
+
+    def make_mogrts():
+        """Stamp one pre-texted caption .mogrt per clip from the loaded sheet.
+
+        Premiere 2026 removed the API for setting mogrt text from a script, so
+        the text is baked into each file instead; the Clip Chopper Labels panel
+        in Premiere then places 'NN - CAPTION.mogrt' onto every clip 'NN - …'.
+        """
+        rows = [r for r in state['rows'] if place_kind(r)]
+        if not rows or not state['sheet']:
+            log('Load a spreadsheet first — the captions come from its rows')
+            return
+        try:
+            from make_caption_mogrts import load_template, stamp
+        except ImportError:
+            log('make_caption_mogrts.py is missing next to chopper.py')
+            return
+        p = filedialog.askopenfilename(
+            title='Your template .mogrt (Graphics and Titles > Export As Motion '
+                  'Graphics Template, once)',
+            initialdir=str(Path(cfg.get('mogrt_template', '')).parent) if cfg.get('mogrt_template') else '.',
+            filetypes=[('Motion Graphics Template', '*.mogrt'), ('All files', '*.*')])
+        if not p:
+            return
+        cfg['mogrt_template'] = p
+        save_settings(cfg)
+        try:
+            tpl = load_template(p)
+        except (SystemExit, Exception) as e:
+            messagebox.showerror('Template mogrt', str(e))
+            return
+        out = state['sheet'].parent / f'{sanitize_filename(state["sheet"].stem)} mogrts'
+        out.mkdir(exist_ok=True)
+        made = 0
+        # numbering mirrors the timeline: gaps keep their slot so 'NN' always
+        # matches the clip names Premiere shows after importing the XML
+        for n, seg in enumerate(timeline_layout(rows, cached_probes(rows)), 1):
+            if seg['kind'] != 'clip':
+                continue
+            text = label_text(seg['row'], team_var.get()).upper()
+            if not text:
+                continue
+            try:
+                stamp(*tpl, out / f'{n:02d} - {sanitize_filename(text)}.mogrt', n, text)
+                made += 1
+            except Exception as e:
+                log(f'mogrt {n:02d} failed: {e}')
+        log(f'{made} caption mogrt(s) -> {out.name}/ — in Premiere: '
+            'Window > Extensions (Legacy) > Clip Chopper Labels, pick that folder')
+        open_media(out)
 
     def preview_label():
         """The label editor: text, size, color, position — live on a real frame."""

@@ -629,6 +629,77 @@ if _ff:
         assert s_off is not None and s_off < s_at, (s_off, s_at)
         assert whistle_score(ffmpeg_bin, srcs['mute.mp4'], 1.5) is None  # no audio
 
+# --- caption mogrt stamping ---------------------------------------------------
+# Premiere 2026 removed the mogrt-text scripting API, so captions are baked into
+# per-clip mogrt copies. The text lives in a FlatBuffers blob behind a 12-byte
+# Adobe wrapper (u32 payload size, u32 0, magic 44 33 22 11), length-prefixed at
+# the buffer tail. The stamp must swap the string, re-pad to 4 bytes, and fix
+# the wrapper size — and must refuse cleanly if the format ever changes.
+import base64 as _b64
+import gzip as _gz
+import io as _io
+import json as _mjson
+import re as _mre
+import struct as _st
+import zipfile as _zf
+from make_caption_mogrts import load_template, stamp
+
+with tempfile.TemporaryDirectory() as td:
+    ph = 'GOAL VS TEAM...'
+    blob = bytearray(_st.pack('<II', 0, 0) + bytes.fromhex('44332211'))
+    blob += b'\x0c\x00\x00\x00TABLEJUNK\x00\x00\x00'          # fake flatbuffer guts
+    blob += _st.pack('<I', len(ph)) + ph.encode() + b'\x00'
+    while len(blob) % 4:
+        blob += b'\x00'
+    _st.pack_into('<I', blob, 0, len(blob) - 12)
+    xml_t = ('<x><StartKeyframeValue Encoding="base64" BinaryHash="k">'
+             + _b64.b64encode(bytes(blob)).decode() + '</StartKeyframeValue></x>')
+    inner_t = _io.BytesIO()
+    with _zf.ZipFile(inner_t, 'w') as z:
+        z.writestr('g.prproj', _gz.compress(xml_t.encode()))
+    definition = {'capsuleID': 'x', 'capsuleName': 'T',
+                  'capsuleNameLocalized': {'strDB': [{'localeString': 'en_US', 'str': 'T'}]},
+                  'clientControls': [{'id': '4', 'value': {'strDB': [
+                      {'localeString': 'en_US', 'str': ph}]}}]}
+    tpl_path = Path(td) / 't.mogrt'
+    with _zf.ZipFile(tpl_path, 'w') as z:
+        z.writestr('definition.json', _mjson.dumps(definition))
+        z.writestr('project.prgraphic', inner_t.getvalue())
+    tpl = load_template(tpl_path)
+    outp = Path(td) / '01.mogrt'
+    stamp(*tpl, outp, 1, 'GOAL VS DCE AND MORE WORDS')        # longer than placeholder
+    with _zf.ZipFile(outp) as z:
+        d2 = _mjson.loads(z.read('definition.json'))
+        assert d2['clientControls'][0]['value']['strDB'][0]['str'] == 'GOAL VS DCE AND MORE WORDS'
+        assert d2['capsuleName'] == '01 GOAL VS DCE AND MORE WORDS'
+        assert d2['capsuleID'] != 'x'                          # fresh id per stamped copy
+        inz = _zf.ZipFile(_io.BytesIO(z.read('project.prgraphic')))
+        x2 = _gz.decompress(inz.read('g.prproj')).decode()
+        b2 = _b64.b64decode(_mre.search(r'>([A-Za-z0-9+/=]+)<', x2).group(1))
+        t2 = b2.find(b'GOAL VS DCE AND MORE WORDS')
+        assert t2 > 0 and ph.encode() not in b2
+        assert _st.unpack_from('<I', b2, t2 - 4)[0] == len('GOAL VS DCE AND MORE WORDS')
+        assert _st.unpack_from('<I', b2, 0)[0] == len(b2) - 12  # wrapper size fixed
+        assert len(b2) % 4 == 0                                 # alignment preserved
+        assert b2[4:t2 - 4] == bytes(blob[4:t2 - 4])            # nothing else disturbed
+    # a template whose format we don't recognize must refuse, not corrupt
+    bad = bytearray(blob)
+    bad[8:12] = b'XXXX'                                        # wrong magic
+    xml_b = ('<x><StartKeyframeValue Encoding="base64" BinaryHash="k">'
+             + _b64.b64encode(bytes(bad)).decode() + '</StartKeyframeValue></x>')
+    inner_b = _io.BytesIO()
+    with _zf.ZipFile(inner_b, 'w') as z:
+        z.writestr('g.prproj', _gz.compress(xml_b.encode()))
+    bad_path = Path(td) / 'bad.mogrt'
+    with _zf.ZipFile(bad_path, 'w') as z:
+        z.writestr('definition.json', _mjson.dumps(definition))
+        z.writestr('project.prgraphic', inner_b.getvalue())
+    try:
+        load_template(bad_path)
+        assert False, 'expected refusal on unknown wrapper'
+    except SystemExit as e:
+        assert 'wrapper' in str(e)
+
 assert sanitize_filename('CTO: "Army" <Commit>?') == 'CTO Army Commit'
 
 # --- usage ping --------------------------------------------------------------
