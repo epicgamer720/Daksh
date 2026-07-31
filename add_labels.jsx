@@ -1,23 +1,20 @@
-/* add_labels.jsx v6 — place PRE-TEXTED mogrts (one per caption, text baked in).
-   Premiere 2026 removed getMGTComponent(), so no script can set mogrt text —
-   instead each clip 'NN - …' gets the mogrt file 'NN - ….mogrt' from a folder. */
+/* add_labels.jsx v7 — place pre-texted caption mogrts, no questions asked.
+   Clears the top video track (previous caption attempts) without a confirm
+   dialog — hidden modals were eating the run. */
 (function () {
     var seq = app.project.activeSequence;
-    if (!seq) { alert('Open the sequence first.'); return; }
+    if (!seq) { alert('Open the sequence first.'); return 'no sequence'; }
     var vTracks = seq.videoTracks;
     var target = vTracks.numTracks - 1;
     var clips = vTracks[0].clips;
-    if (!clips.numItems) { alert('No clips on V1.'); return; }
+    if (!clips.numItems) { alert('No clips on V1.'); return 'no clips'; }
     var top = vTracks[target];
-    if (top.clips.numItems > 0) {
-        if (!confirm('Top track V' + (target + 1) + ' holds ' + top.clips.numItems +
-                     ' old graphics. Remove them and place the captions?')) return;
-        for (var r = top.clips.numItems - 1; r >= 0; r--) {
-            try { top.clips[r].remove(false, false); } catch (eR) {}
-        }
+    var cleared = 0;
+    for (var r = top.clips.numItems - 1; r >= 0; r--) {
+        try { top.clips[r].remove(false, false); cleared++; } catch (eR) {}
     }
     var dir = Folder.selectDialog('Pick the folder of caption .mogrts');
-    if (!dir) return;
+    if (!dir) { return 'cancelled'; }
     var mogrts = dir.getFiles('*.mogrt');
     function forSlot(slot) {
         for (var i = 0; i < mogrts.length; i++) {
@@ -35,6 +32,7 @@
         placed++;
         try { var t = new Time(); t.ticks = clips[n].end.ticks; item.end = t; } catch (e) {}
     }
-    alert('Placed ' + placed + ' captions (text baked into each mogrt).' +
+    alert('Cleared ' + cleared + ' old graphics, placed ' + placed + ' captions.' +
           (skipped.length ? '\nNo mogrt for: ' + skipped.join(', ') : ''));
+    return 'placed ' + placed;
 })();
