@@ -233,8 +233,8 @@ def parse_sheet(path):
                 label=get(raw, cols.get('label')))
         r.notes = ' | '.join(v for c in cols.get('notes', []) if (v := get(raw, c)))
         if (o := get(raw, cols.get('order'))):
-            try:
-                r.order = int(float(o))
+            try:                        # '7', '7.0', and ordinals like '7th'
+                r.order = int(float(re.sub(r'(?<=\d)(st|nd|rd|th)$', '', o.lower())))
             except ValueError:
                 pass
         if not clip_text:
@@ -257,6 +257,23 @@ def parse_sheet(path):
         rows.append(r)
     if not rows:
         raise ValueError('No clip rows found in this sheet')
+    # Some sheets put the play ("Goal", "CTO"...) in a column HEADED Notes with no
+    # Label column at all — captions then read "VS TEAM" with no play. If labels
+    # are empty but a notes column holds short, repeated, non-URL values, that
+    # column is the real label column: promote it.
+    if not any(r.label for r in rows) and cols.get('notes'):
+        for c in cols['notes']:
+            vals = [v for raw2 in grid[header_row + 1:] if (v := get(raw2, c))]
+            if (len(vals) >= len(rows) // 2 and 'http' not in ' '.join(vals).lower()
+                    and max(len(v) for v in vals) <= 40):
+                by_sheet_row = {r.sheet_row: r for r in rows}
+                for i2, raw2 in enumerate(grid):
+                    r2 = by_sheet_row.get(i2 + 1)
+                    if r2 is not None:
+                        r2.label = get(raw2, c)
+                        r2.notes = ' | '.join(v for c2 in cols['notes'] if c2 != c
+                                              and (v := get(raw2, c2)))
+                break
     big = 10 ** 6
     rows.sort(key=lambda r: r.order if r.order is not None else big + r.sheet_row)
     return rows

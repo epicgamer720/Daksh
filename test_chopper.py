@@ -50,6 +50,32 @@ right = match_score('3D Georgia', '3d NE Red 2029 vs 3d Georgia')
 wrong = match_score('3D Georgia', '29s 3D NE Red vs 91 georgia')
 assert right - wrong > 0.1, (right, wrong)
 
+# --- labels living in a "Notes" column, ordinal order values -----------------
+# Will's sheet: no Label column at all — the play word sits in a second column
+# HEADED "Notes", and Order says "10th"/"11th". Captions came out "VS TEAM"
+# with no play until the notes column was promoted to labels.
+will = [
+    ['', 'Game/Showcase', 'Game', '# of Seconds', 'Notes', 'Order', '', '',
+     'Order for Tape', 'Clip', 'Notes', ''],
+    ['', '', 'vs 2Way', '', '', '10th', '', '', '', '24:06-24:16', 'Goal',
+     'https://youtube.com/x'],
+    ['', '3d Upstate', 'vs Primetime', '', '', '1st', '', '', '', '09:35-09:45', 'Goal',
+     'https://youtube.com/y'],
+    ['', '', 'vs Riot', '', '', '2nd', '', '', '', '05:12-05:22', 'CTO',
+     'https://youtube.com/z'],
+]
+with tempfile.TemporaryDirectory() as td:
+    import csv as _csv
+    wp = Path(td) / 'will.csv'
+    with open(wp, 'w', newline='') as f:
+        _csv.writer(f).writerows(will)
+    wrows = parse_sheet(wp)
+    assert [r.game for r in wrows] == ['vs Primetime', 'vs Riot', 'vs 2Way']  # 1st,2nd,10th
+    assert [r.label for r in wrows] == ['Goal', 'CTO', 'Goal']    # promoted from Notes
+    assert [r.order for r in wrows] == [1, 2, 10]                 # ordinals parsed
+    assert all('youtube' not in r.label for r in wrows)   # URLs never become labels
+    assert all('youtube' not in r.notes for r in wrows)   # (their column has no header)
+
 # --- header detection on a differently-formatted sheet ----------------------
 alt = [
     ['Some title junk', '', ''],
